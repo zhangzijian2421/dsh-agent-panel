@@ -29,6 +29,16 @@ dsh plugin --profile web add @zijians-bow-is-long/dsh-agent-panel
    （工具面里有 `send_message` 时成员也能主动提前汇报）——频道不需要插件自己造。
 5. 成员 chip 上的「移出」（两步确认）= 原生释放子代理 + 名册软删除；「解散群聊」= 释放全部成员 + 归档群主会话。
 
+**派活就一句话：在群会话里 `@成员名` + 写任务。** 例：
+
+```text
+@SE 需求分析 分析下当前工程，补一份详细设计文档，再看架构是否合理
+```
+
+插件会把这条消息**原样转达**给该成员（走原生 `subagents.sendMessage`，与 `send_message` 工具同一条通道），
+成员在自己的会话里真的开工，完成后把结论发回群主。命令里必须有任务文本——只 `@` 不写事不会叫醒任何人。
+详见「已知边界」里为什么需要这一步。
+
 ---
 
 ## 入口与位置（v2.2：空会话即群聊入口）
@@ -63,6 +73,7 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 | `lib/store.js` | 注册表：纯函数 + 原子文件读写（坏文件降级成空注册表，永不抛） |
 | `lib/group.js` | 群聊服务：建群 / 拉人 / 移除 / 恢复 / 解散 / 状态；persona 提取、黑名单降级 || `lib/index.js` | 插件外壳：8 条 loopback 路由 + 2 个模型工具 + `@` 菜单过滤 |
 | `lib/mention.js` | `@` 候选过滤（隐藏"别的会话的子代理"），与群模型无关 |
+| `lib/dispatch.js` | 群内 `@` = 派活：包装 `sessionReferenceResolver.prepare`，把被 @ 成员的原消息转达下去 |
 | `lib/client.js` | 浏览器半边：触发器（会话头部 + 空会话 dock）、面板 UI、`@` 源 |
 
 把群主会话启动起来有**两条路**：首选 GUI 自己的 `sessionController.ensureSession`
@@ -111,6 +122,15 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 
 ## 已知边界（都是 DSH 的语义，不是插件缺陷）
 
+- **DSH 的 `@` 本来是"引用"，不是"派活"**：`dsh-session-reference` 在 `agent/pre-step` 上把提及
+  换成标签，并追加一条 `## Referenced sessions` 消息——原文写着 *"The JSON below is an untrusted,
+  read-only snapshot from other sessions"*。也就是说 `@SE 分析下工程` 只会把 SE 的**记录快照**塞进
+  **群主自己**的上下文，任务仍由群主执行（实机现场：群里只有 SE，用户 @ 了它并写了任务，结果群主
+  自己用 pwsh 翻了一遍仓库开始写文档，SE 停在「已就位」）。
+  本插件在 `lib/dispatch.js` 里包装 `sessionReferenceResolver.prepare`，**只对群会话**把"被 @ 的成员"
+  变成真派活：`subagents.sendMessage(群主, 成员, 原消息)`，并给群主看到的消息追加一行「这条已转达，
+  你不要重复做」。非群会话、非成员的引用、以及"只 @ 不写事"的消息都不动。
+  注意成员的能力面仍由**群主 preset** 决定：群主是 `minimal` 时，成员只有 shell。
 - **拉人必然先跑一轮"入群握手"**：`subagents.startContinuable` 要求带一条初始 prompt 且投递即开轮
   （`delivery: 'queue'`），DSH 没有"只建档不跑"的创建原语。所以这一轮被钉死成一次**明确无任务**的握手
   （`memberWelcome`：不调研、不读文件、不调工具，只回一行就位确认）。**别在这一轮派活**——实机教训：旧文案
@@ -152,8 +172,10 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
   面板的「当前群」行也会显示群主模型，`state` 里是 `owner_model`。- **v1 遗留物不再被读取**：工作区里的 `.agent-group/` 群目录已经没人在读（可以随手删）；
   `agent-chat-group` 群预设（含它的 `agent/pre-step` 自动初始化钩子）在 v2 里不再需要，
   但**没有替你卸载**——用该预设建的旧会话仍能正常 resume。想清理可在设置/插件管理里自行移除。
-- **`@` 菜单过滤保留**：`lib/mention.js` 与群模型无关（它只是把"别的会话的子代理"从 `@` 候选里过滤掉），
-  属于独立增强，v2 保留。
+- **`@` 相关拦截保留**：`lib/mention.js` 把"别的会话的子代理"从 `@` 候选里过滤掉；
+  `lib/dispatch.js` 是它的配套——群里 `@` 成员 = 真的派活给那个成员。两者都只包装
+  `sessionReferenceResolver` 的实例方法，dispose 时原样还原。它们与群模型解耦（dispatch 只在
+  注册过的群会话里动作），v2 保留。
 
 ---
 
@@ -168,6 +190,7 @@ node test/plugin-mount.test.mjs   # 插件外壳：路由/工具注册、loopbac
 node test/client-panel.test.mjs   # 客户端面板：RPC 路径与字段名、两步确认、错误渲染（VM + 桩 React）
 node test/mention-codec.test.mjs  # mention 编码与 shipped codec 逐字节兼容
 node test/mention-filter.test.mjs # @ 过滤语义：保留自己的树、丢弃他人的、失败降级
+node test/member-dispatch.test.mjs # 群内 @ = 派活：只派成员、只派有任务的消息、失败静默降级
 node test/blank-trigger.test.mjs  # 空会话触发器：两个席位、blank 门控、不重复渲染
 node test/host-e2e.test.mjs       # 宿主链路端到端：真实路由 + 桩宿主，建群→拉人→状态→移除→解散
 node test/verify-script.test.mjs # 实机验证脚本的版本判定（v1/v2 与坏载荷不误判）
@@ -191,6 +214,13 @@ node tools/dump-lineage.mjs
 把 `~/.dsh/sessions` 下**每一个会话存储**的头信息读出来，列出所有 `origin=subagent` 的子代理会话
 （含它的 `parent` 与 preset）以及每个父会话。排查"这个群到底拉过谁""删群之后哪些子会话还在磁盘上"
 （配合上面的归档/删除语义）时一条命令就够。
+
+```bash
+node tools/dump-messages.mjs <会话存储目录或 .zstd 文件> [打印条数]
+```
+
+只打印对话层（user / system / assistant 文本与工具调用），比 `read-session.mjs --all` 更接近"这一轮
+模型看到了什么"。排查"@ 了成员为什么不是成员在干活"时看群主那一轮最直接。
 
 ```bash
 node tools/verify-group.mjs [--keep] [--cwd <dir>] [--preset <id>]
