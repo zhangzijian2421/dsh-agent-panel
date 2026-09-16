@@ -185,6 +185,14 @@ DSH 的会话日志是**多帧 zstd** 的 JSONL（Node 的一次性解压只读�
 并把 `request/header` 里的工具面打出来——排查"成员到底拿到了哪些工具"时非常有用。
 
 ```bash
+node tools/dump-lineage.mjs
+```
+
+把 `~/.dsh/sessions` 下**每一个会话存储**的头信息读出来，列出所有 `origin=subagent` 的子代理会话
+（含它的 `parent` 与 preset）以及每个父会话。排查"这个群到底拉过谁""删群之后哪些子会话还在磁盘上"
+（配合上面的归档/删除语义）时一条命令就够。
+
+```bash
 node tools/verify-group.mjs [--keep] [--cwd <dir>] [--preset <id>]
 ```
 
