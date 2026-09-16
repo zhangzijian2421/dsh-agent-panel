@@ -4,4 +4,4 @@
 # and the dropdown panel, served from this package's lib/client.js).
 - insert:
     - id: agent-panel
-      name: '@local/dsh-agent-panel'
+      name: '@zijians-bow-is-long/dsh-agent-panel'

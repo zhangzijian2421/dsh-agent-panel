@@ -1,7 +1,7 @@
 {
-  "name": "@local/dsh-agent-panel",
+  "name": "@zijians-bow-is-long/dsh-agent-panel",
   "description": "拉 Agent 面板：任意会话右上角把已安装 preset 拉成本会话常驻成员；聊天群会话同步 roster.json 与 chat.log",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
