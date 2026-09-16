@@ -27,6 +27,8 @@ const STATE = {
 			preset_id: "standard",
 			owner_live: true,
 			owner_model: "deepseek-official/deepseek-flash",
+			workspace_id: "ws-1",
+			workspace_title: "项目A",
 			created_at: 2,
 			members: [{ id: "m1", name: "SE 需求分析", preset_id: "se", status: "running", registered: true }],
 			removed: [{ id: "m0", name: "老成员", preset_id: "se" }]
@@ -54,7 +56,8 @@ const WORKSPACES = [
 function makeInstance(overrides) {
 	const canned = {
 		"/api/dsh-agent-panel/state": JSON.parse(JSON.stringify(STATE)),
-		"/api/dsh-agent-panel/group-create": { ok: true, id: "group-new", name: "群聊 · 1", cwd: "D:\\work", preset_id: "standard", owner_model: "deepseek-official/deepseek-flash" },
+		"/api/dsh-agent-panel/group-create": { ok: true, id: "group-new", name: "群聊 · 1", cwd: "D:\\work", preset_id: "standard", owner_model: "deepseek-official/deepseek-flash", workspace_title: "项目A" },
+		"/api/dsh-agent-panel/group-attach": { ok: true, workspace_id: "ws-1", workspace_title: "项目A", already: false },
 		...(overrides || {})
 	};
 	const effects = [];
@@ -130,8 +133,8 @@ await suite.check("列出每个群：目录 / preset / 模型 / 成员 / 已移�
 });
 
 console.log("groups page: 创建工作区挂载")
-await suite.check("创建群聊：POST /group-create（cwd + preset）后自动 insertSessionBefore", async () => {
-	const { instance, effects, props } = makeInstance();
+await suite.check("创建群聊：POST /group-create（cwd + preset）后调宿主 group-attach 归属", async () => {
+	const { instance, props } = makeInstance();
 	const node = await page(instance, props);
 	instance.calls.length = 0;
 	findButton(node, "创建群聊").props.onClick();
@@ -139,16 +142,15 @@ await suite.check("创建群聊：POST /group-create（cwd + preset）后自动 
 	const call = instance.calls.find((row) => row.path.endsWith("/group-create"));
 	assert.ok(call !== undefined, "没有发出 group-create 请求");
 	assert.deepEqual(call.body, { cwd: "D:\\work", preset_id: "standard" });
-	const inserted = effects.find((row) => row.kind === "insert");
-	assert.ok(inserted !== undefined, "创建后必须把群会话挂进工作区");
-	assert.deepEqual(inserted, { kind: "insert", workspaceId: "ws-1", sessionId: "group-new", beforeSessionId: undefined });
+	const attachCall = instance.calls.find((row) => row.path.endsWith("/group-attach"));
+	assert.ok(attachCall !== undefined, "创建后必须调宿主把它归属到工作区（客户端 insertSessionBefore 对未归属会话会报 not accounted）");
+	assert.deepEqual(attachCall.body, { group_id: "group-new" });
 });
-await suite.check("目录不是工作区时：先 workspaces.create 再挂载", async () => {
+await suite.check("宿主说目录不是工作区时：客户端先 workspaces.create 再重试归属", async () => {
 	const { instance, effects, props, canned } = makeInstance();
-	// 罐头响应要回显请求里的 cwd（真实宿主就是这么回的），否则挂载会按旧的目录去找工作区
 	canned["/api/dsh-agent-panel/group-create"] = { ok: true, id: "group-new", name: "群聊 · 1", cwd: "D:\\brand-new", preset_id: "standard" };
+	canned["/api/dsh-agent-panel/group-attach"] = { ok: false, error: "该目录还不是工作区（先在 GUI 里把它加为工作区）" };
 	const node = await page(instance, props);
-	// 第一个下拉是工作区选择器：改成一个全新的目录
 	const selects = findSelects(node);
 	selects[0].props.onChange({ target: { value: "D:\\brand-new" } });
 	const rerendered = instance.render(instance.seats.get("main"), props);
@@ -157,10 +159,8 @@ await suite.check("目录不是工作区时：先 workspaces.create 再挂载", 
 	const created = effects.find((row) => row.kind === "create");
 	assert.ok(created !== undefined, "目录不在工作区列表里时应新建工作区");
 	assert.deepEqual(created, { kind: "create", path: "D:\\brand-new" });
-	const inserted = effects.filter((row) => row.kind === "insert");
-	assert.equal(inserted.length, 1);
-	assert.equal(inserted[0].workspaceId, "ws-new");
-	assert.equal(inserted[0].sessionId, "group-new");
+	const attaches = instance.calls.filter((row) => row.path.endsWith("/group-attach"));
+	assert.equal(attaches.length, 2, "归属失败且原因是不是工作区时应重试一次");
 });
 await suite.check("「选择目录」用 uiWorkspace.pickDirectory，选中后按它建群", async () => {
 	const { instance, effects, props } = makeInstance();
@@ -177,14 +177,17 @@ await suite.check("「选择目录」用 uiWorkspace.pickDirectory，选中后�
 });
 
 console.log("groups page: 挂载与群操作")
-await suite.check("「挂到侧边栏」把未挂的群挂到它目录对应的工作区", async () => {
-	const { instance, effects, props } = makeInstance();
+await suite.check("「挂到侧边栏」POST /group-attach（宿主侧 attachSession）", async () => {
+	const { instance, props } = makeInstance();
 	const node = await page(instance, props);
+	instance.calls.length = 0;
 	findButton(node, "挂到侧边栏").props.onClick();
 	await new Promise((resolve) => setImmediate(resolve));
-	assert.deepEqual(effects.find((row) => row.kind === "insert"), {
-		kind: "insert", workspaceId: "ws-2", sessionId: "group-free", beforeSessionId: undefined
-	});
+	const attachCall = instance.calls.find((row) => row.path.endsWith("/group-attach"));
+	assert.ok(attachCall !== undefined, "没有发出 group-attach 请求");
+	assert.deepEqual(attachCall.body, { group_id: "group-free" });
+	const after = instance.render(instance.seats.get("main"), props);
+	assert.ok(texts(after).indexOf("项目A") >= 0, "归属成功后应给出提示：" + texts(after));
 });
 await suite.check("「打开群聊会话」走 uiWorkspace.openSession", async () => {
 	const { instance, effects, props } = makeInstance();
@@ -265,12 +268,27 @@ await suite.check("没有群聊时给出空态提示", async () => {
 	const node = await page(instance, props);
 	assert.ok(texts(node).indexOf("还没有群聊") >= 0, texts(node));
 });
-await suite.check("workspaces 服务缺席时不崩，只提示未挂到侧边栏", async () => {
-	const canned = { "/api/dsh-agent-panel/state": JSON.parse(JSON.stringify(STATE)) };
+await suite.check("客户端没有 workspaces 服务时，宿主归属仍可用（不需要它）", async () => {
+	const canned = {
+		"/api/dsh-agent-panel/state": JSON.parse(JSON.stringify(STATE)),
+		"/api/dsh-agent-panel/group-attach": { ok: true, workspace_id: "ws-1", workspace_title: "项目A", already: false }
+	};
 	const instance = loadClient({ canned, services: {} });
 	const props = { useWorkspaces: (selector) => selector({ items: WORKSPACES }) };
 	const node = await page(instance, props);
-	assert.ok(texts(node).indexOf("挂到侧边栏") >= 0, "仍应渲染挂载按钮：" + texts(node));
+	findButton(node, "挂到侧边栏").props.onClick();
+	await new Promise((resolve) => setImmediate(resolve));
+	const after = instance.render(instance.seats.get("main"), props);
+	assert.ok(texts(after).indexOf("项目A") >= 0, "归属走宿主路由，客户端没有 workspaces 服务也应成功：" + texts(after));
+});
+await suite.check("客户端没有 workspaces 服务、宿主又说不是工作区时：如实提示", async () => {
+	const canned = {
+		"/api/dsh-agent-panel/state": JSON.parse(JSON.stringify(STATE)),
+		"/api/dsh-agent-panel/group-attach": { ok: false, error: "该目录还不是工作区（先在 GUI 里把它加为工作区）" }
+	};
+	const instance = loadClient({ canned, services: {} });
+	const props = { useWorkspaces: (selector) => selector({ items: WORKSPACES }) };
+	const node = await page(instance, props);
 	findButton(node, "挂到侧边栏").props.onClick();
 	await new Promise((resolve) => setImmediate(resolve));
 	const after = instance.render(instance.seats.get("main"), props);

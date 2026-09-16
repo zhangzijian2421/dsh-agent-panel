@@ -67,6 +67,7 @@ function makeHost(options) {
     drained: [],
     startFails: (options && options.startFails) || null,
     omitAgentOptions: (options && options.omitAgentOptions) === true,
+    workspaces: [],
     resumePreset: (options && options.resumePreset) || null,
     resumeCwd: (options && options.resumeCwd) || null
   }
@@ -103,6 +104,13 @@ function makeHost(options) {
             state.sessions.set(agent.id, { id: agent.id })
             return { agent }
           }
+        }
+      }
+      if (name === 'workspaceRegistry') {
+        return {
+          list: () => state.workspaces,
+          get: (id) => state.workspaces.find((item) => String(item.id) === String(id)),
+          async archiveSession(id) { state.archived.push(id) }
         }
       }
       if (name === 'agentDefaultModel') {
@@ -435,6 +443,97 @@ await check('群主没有模型时拉人被明确拒绝（不去造一个注定�
     assert.equal(pulled.ok, false)
     assert.match(pulled.error, /没有 provider\/model/)
     assert.equal(host.state.specs.length, 0, '不该启动成员')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+console.log('group: 归属到工作区（决定群聊是否出现在侧边栏）')
+await check('建群后自动 attachSession 归属，并在响应里回报工作区', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    const attached = []
+    host.state.workspaces.push({
+      id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
+      async attachSession(sessionId) { attached.push(String(sessionId)); this.sessionIds = [String(sessionId), ...this.sessionIds] }
+    })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(created.ok, true, created.error)
+    assert.deepEqual(attached, [created.id], '建群就该归属（否则不会出现在工作区下面）')
+    assert.equal(created.workspace_id, 'ws-1')
+    assert.equal(created.workspace_title, '项目A')
+    // 已归属后再建一个同名目录的群：新的会话也会被归属于同一工作区
+    const second = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(attached.length, 2)
+    assert.equal(second.workspace_title, '项目A')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('目录不是工作区：建群仍成功，但如实报告未归属', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\nowhere', preset_id: 'standard' })
+    assert.equal(created.ok, true, created.error)
+    assert.equal(created.workspace_id, undefined)
+    assert.match(created.workspace_error, /还不是工作区/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('state 暴露每群的归属工作区', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    host.state.workspaces.push({
+      id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
+      async attachSession(sessionId) { this.sessionIds = [String(sessionId), ...this.sessionIds] }
+    })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    const row = (await service.state()).groups.find((item) => item.id === created.id)
+    assert.equal(row.workspace_id, 'ws-1')
+    assert.equal(row.workspace_title, '项目A')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('attach()：已归属是幂等成功，不是工作区是明确失败', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    let calls = 0
+    host.state.workspaces.push({
+      id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
+      async attachSession(sessionId) { calls += 1; this.sessionIds = [String(sessionId), ...this.sessionIds] }
+    })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(calls, 1, '建群时已归属一次')
+    const again = await service.attach({ group_id: created.id })
+    assert.equal(again.ok, true)
+    assert.equal(again.already, true)
+    assert.equal(calls, 1, '已经归属过就不该重复调用')
+    const missing = await service.attach({ group_id: 'group-nope' })
+    assert.equal(missing.ok, false)
+    assert.match(missing.error, /群聊不存在/)
+    const elsewhere = await service.createGroup({ cwd: 'D:\\nowhere', preset_id: 'standard' })
+    const failed = await service.attach({ group_id: elsewhere.id })
+    assert.equal(failed.ok, false)
+    assert.match(failed.error, /还不是工作区/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('拉人时顺手自愈：老群会在这里补上归属', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(created.workspace_id, undefined, '建群时还没有这个工作区')
+    const attached = []
+    host.state.workspaces.push({
+      id: 'ws-9', path: 'D:\\work', title: '项目A', sessionIds: [],
+      async attachSession(sessionId) { attached.push(String(sessionId)) }
+    })
+    const pulled = await service.pull({ group_id: created.id, preset_id: 'se' })
+    assert.equal(pulled.ok, true, pulled.error)
+    assert.deepEqual(attached, [created.id], '拉人时应把未归属的群补挂上')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 

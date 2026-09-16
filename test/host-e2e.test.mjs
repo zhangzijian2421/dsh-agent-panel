@@ -40,6 +40,10 @@ function makeHarness() {
 		agents: new Map(),
 		children: new Map(),
 		sessions: new Map([['session-me', { id: 'session-me', header: { cwd: 'D:\\work' } }]]),
+		workspaces: [{
+			id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
+			async attachSession(sessionId) { state.workspaces[0].sessionIds = [String(sessionId), ...state.workspaces[0].sessionIds] }
+		}],
 		titles: [],
 		archived: [],
 		specs: [],
@@ -120,7 +124,11 @@ function makeHarness() {
 				return { rename: (session, title) => { state.titles.push({ id: session.id, title }) } }
 			}
 			if (service === 'workspaceRegistry') {
-				return { async archiveSession(id) { state.archived.push(id) } }
+				return {
+					list: () => state.workspaces,
+					get: (id) => state.workspaces.find((item) => String(item.id) === String(id)),
+					async archiveSession(id) { state.archived.push(id) }
+				}
 			}
 			return undefined
 		}
@@ -168,6 +176,8 @@ await check('POST /group-create：用当前会话的 cwd 建出群主会话 + �
 	groupId = created.id
 	assert.deepEqual(harness.state.ensureCalls, [{ id: created.id, cwd: 'D:\\work', preset: 'standard' }])
 	assert.equal(created.started_via, 'sessionController', '首选 GUI 自己的启动路径')
+	assert.equal(created.workspace_title, '项目A', '建群应自动归属到该目录的工作区')
+	assert.deepEqual(harness.state.workspaces[0].sessionIds, [created.id], '归属就是把会话放进工作区的 sessionIds')
 	assert.equal(created.owner_model, 'deepseek-official/deepseek-flash', '群主 agent 必须有 provider/model')
 	assert.equal(harness.state.titles[0].title, '群聊 · 1')
 	assert.equal(existsSync(registryFile), true, '注册表应落在临时 HOME 下')
@@ -220,7 +230,16 @@ await check('GET /members?sessionId=：@ 菜单源拿到本会话成员', async 
 	assert.equal(payload.members[0].name, 'SE 需求分析')
 })
 
-console.log('e2e: 移除 / 恢复 / 改名 / 解散')
+console.log('e2e: 归属与移除')
+await check('POST /group-attach：已归属时幂等成功', async () => {
+	const attached = await call(harness.routes, '/api/dsh-agent-panel/group-attach', 'POST', { group_id: groupId })
+	assert.equal(attached.ok, true, attached.error)
+	assert.equal(attached.already, true)
+	assert.equal(attached.workspace_title, '项目A')
+	const missing = await call(harness.routes, '/api/dsh-agent-panel/group-attach', 'POST', { group_id: 'group-nope' })
+	assert.equal(missing.ok, false)
+	assert.match(missing.error, /群聊不存在/)
+})
 await check('POST /release：释放原生子代理 + 名册软删除', async () => {
 	const released = await call(harness.routes, '/api/dsh-agent-panel/release', 'POST', { group_id: groupId, member_id: memberId })
 	assert.equal(released.ok, true, released.error)
