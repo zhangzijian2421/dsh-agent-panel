@@ -25,6 +25,7 @@ import {
   makeSignal,
   mapChildRows,
   memberNotice,
+  memberWelcome,
   parsePersonaPrefix
 } from '../lib/group.js'
 import { readRegistryFile } from '../lib/store.js'
@@ -195,12 +196,22 @@ await check('mapChildRows 只保留 child，边角字段有兜底', () => {
 	assert.deepEqual(rows[0], { id: 'c1', name: 'SE', status: 'running', mode: 'continuable' })
 	assert.deepEqual(rows[1], { id: 'c2', name: 'c2', status: 'idle', mode: 'one-shot' })
 })
-await check('memberNotice 交代群名、群主 id 与汇报方式', () => {
+await check('memberNotice 交代群名、群主 id、汇报方式与「没任务别动手」', () => {
 	const text = memberNotice({ groupName: '群聊 · 1', memberName: 'SE', groupId: 'group-abc' })
 	assert.match(text, /群聊 · 1/)
 	assert.match(text, /SE/)
 	assert.match(text, /send_message\(agent_id="group-abc"\)/)
 	assert.match(text, /兄弟会话/)
+	// 没有任务的握手消息不能触发调研（实机踩过：成员自发跑了 15 步 / 21 次 bash）。
+	assert.match(text, /没带任务的问候／握手消息不是任务/)
+	assert.match(text, /不要调研/)
+})
+await check('memberWelcome 是一条明确无任务的握手，并禁止调工具', () => {
+	const text = memberWelcome({ groupName: '群聊 · 1', memberName: 'SE', presetId: 'se' })
+	assert.match(text, /本轮没有任务/)
+	assert.match(text, /不要调用任何工具/)
+	assert.match(text, /已就位 · SE/)
+	assert.match(text, /preset se/)
 })
 await check('capabilityWarning 只对 minimal 群主报警', () => {
 	assert.equal(capabilityWarning('standard'), undefined)
@@ -354,7 +365,10 @@ await check('拉人：label/persona/黑名单/maxDepth 与注册表都正确', a
 		assert.equal(spec.request.maxDepth, 1)
 		assert.deepEqual(spec.request.toolFilter.deny, MEMBER_TOOL_DENY)
 		assert.match(spec.request.persona, /只做需求分析/)
-		assert.match(spec.request.prompt[0].text, /欢迎「SE 需求分析」/)
+		// 第一轮必须是握手（明确无任务、禁调工具），否则成员会把入群当任务自发开工。
+		assert.match(spec.request.prompt[0].text, /入群握手 · 本轮没有任务/)
+		assert.match(spec.request.prompt[0].text, /不要调用任何工具/)
+		assert.doesNotMatch(spec.request.prompt[0].text, /先动手/)
 		assert.ok(spec.signal && typeof spec.signal.throwIfAborted === 'function')
 		const registry = JSON.parse(readFileSync(join(dir2, 'groups.json'), 'utf8'))
 		assert.equal(registry.groups[groupId].members[0].presetId, 'se')
