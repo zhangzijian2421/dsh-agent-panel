@@ -126,6 +126,7 @@ node test/client-panel.test.mjs   # 客户端面板：RPC 路径与字段名、�
 node test/mention-codec.test.mjs  # mention 编码与 shipped codec 逐字节兼容
 node test/mention-filter.test.mjs # @ 过滤语义：保留自己的树、丢弃他人的、失败降级
 node test/blank-trigger.test.mjs  # 空会话触发器：两个席位、blank 门控、不重复渲染
+node test/host-e2e.test.mjs       # 宿主链路端到端：真实路由 + 桩宿主，建群→拉人→状态→移除→解散
 node test/verify-script.test.mjs # 实机验证脚本的版本判定（v1/v2 与坏载荷不误判）
 ```
 
@@ -173,7 +174,7 @@ lib/
   store.js      群聊注册表（纯函数 + 文件层）
   mention.js    @ 候选过滤
   client.js     浏览器半边
-test/           8 个纯 node 测试
+test/           9 个纯 node 测试
 tools/          read-session.mjs（会话日志解码）、verify-group.mjs（端到端实机验证）
 docs/
   group-above-session.md   可行性分析：为什么是"独立群主会话"、官方 team 包调研、多 preset 结论
