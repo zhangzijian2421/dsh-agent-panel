@@ -81,6 +81,7 @@ const CANNED = {
 			cwd: "D:\\work",
 			preset_id: "minimal",
 			owner_live: true,
+			owner_model: "deepseek-official/deepseek-flash",
 			created_at: 1,
 			capability_warning: "群主 preset 是 minimal（只有持久 shell）",
 			members: [
@@ -232,6 +233,7 @@ await check("拿到状态后渲染群聊、成员、已移除、preset 与能力
 	assertThat(text.includes("标准模式") && text.includes("SE 需求分析"), "缺可拉 preset 列表");
 	assertThat(text.includes("群主 preset 是 minimal"), "缺能力面告警");
 	assertThat(findButton(panel, "打开群聊会话") !== undefined, "缺打开会话按钮");
+	assert(text.includes("deepseek-official/deepseek-flash"), "应显示群主模型：" + text);
 });
 
 console.log("client panel: 交互")

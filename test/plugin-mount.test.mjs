@@ -3,10 +3,20 @@
  *
  * 覆盖：插件身份（name/inject）、8 条路由与 2 个模型工具的注册、loopback 围栏、
  * 方法校验、GET 查询串解析、以及"服务全缺席时 state 降级成空列表"这条最容易回归的路径。
+ *
+ * 注册表路径取自 `os.homedir()`（每次调用重读），所以这里把 USERPROFILE 指到临时目录：
+ * 否则测试会读到**用户真实**的 `~/.dsh/dsh-agent-panel/groups.json`，断言随实际群聊数量漂移。
  */
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply, inject, installMentionFilter, name } from '../lib/index.js'
 import { MEMBER_TOOL_DENY } from '../lib/group.js'
+
+const home = mkdtempSync(join(tmpdir(), 'agrp-mount-'))
+const previousProfile = process.env.USERPROFILE
+process.env.USERPROFILE = home
 
 const results = []
 function check(label, fn) {
@@ -187,6 +197,10 @@ await check('resolver 就位时安装可回滚的过滤', async () => {
 	const rows = await resolver.listCandidates({ id: 'me' }, '', 10, undefined)
 	assert.equal(rows.length, 2)
 })
+
+if (previousProfile === undefined) delete process.env.USERPROFILE
+else process.env.USERPROFILE = previousProfile
+rmSync(home, { recursive: true, force: true })
 
 const failed = results.filter((row) => !row.ok)
 console.log('')

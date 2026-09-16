@@ -65,7 +65,10 @@ function makeHost(options) {
     resumes: [],
     mounts: [],
     drained: [],
-    startFails: (options && options.startFails) || null
+    startFails: (options && options.startFails) || null,
+    omitAgentOptions: (options && options.omitAgentOptions) === true,
+    resumePreset: (options && options.resumePreset) || null,
+    resumeCwd: (options && options.resumeCwd) || null
   }
   let started = 0
   const ctx = {
@@ -74,21 +77,37 @@ function makeHost(options) {
         return {
           get: (id) => state.agents.get(id),
           async create(options) {
-            state.creates.push({ sessionId: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset })
+            state.creates.push({ sessionId: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset, agentOptions: options.agentOptions })
             if (typeof options.setup === 'function') await options.setup({ label: 'agentCtx' })
-            const agent = { id: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset }
+            const agent = {
+              id: options.sessionId,
+              cwd: options.meta.cwd,
+              preset: options.meta.agentPreset,
+              // 真实宿主里 agent.options 带 provider/model；没有它 agent 是残的（见 defaultAgentOptions 的注释）。
+              options: state.omitAgentOptions === true ? {} : (options.agentOptions || { provider: 'deepseek-official', model: 'deepseek-flash' })
+            }
             state.agents.set(agent.id, agent)
             state.sessions.set(agent.id, { id: agent.id })
             return { agent }
           },
           async resume(options) {
-            state.resumes.push(options.resumeSessionId)
+            state.resumes.push({ id: options.resumeSessionId, agentOptions: options.agentOptions })
             if (typeof options.setup === 'function') await options.setup({ label: 'agentCtx' })
-            const agent = { id: options.resumeSessionId, cwd: state.resumeCwd || 'D:\\work', preset: state.resumePreset || 'standard' }
+            const agent = {
+              id: options.resumeSessionId,
+              cwd: state.resumeCwd || 'D:\\work',
+              preset: state.resumePreset || 'standard',
+              options: options.agentOptions || { provider: 'deepseek-official', model: 'deepseek-flash' }
+            }
             state.agents.set(agent.id, agent)
             state.sessions.set(agent.id, { id: agent.id })
             return { agent }
           }
+        }
+      }
+      if (name === 'agentDefaultModel') {
+        return {
+          currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' })
         }
       }
       if (name === 'subagents') {
@@ -122,7 +141,13 @@ function makeHost(options) {
         return {
           async ensureSession(id, cwd, check, preset) {
             state.ensureCalls.push({ id, cwd, check, preset })
-            const agent = { id, cwd, preset }
+            // 真实实现里 agentOptions 由 controller 自己带上（agentDefaultModel.currentSelection）。
+            const agent = {
+              id,
+              cwd,
+              preset,
+              options: state.omitAgentOptions === true ? {} : { provider: 'deepseek-official', model: 'deepseek-flash' }
+            }
             state.agents.set(id, agent)
             state.sessions.set(id, { id })
             return agent
@@ -295,7 +320,7 @@ await check('拉人失败路径：群不存在 / preset 不存在 / 群主起不
     const offline = createGroupService(noController, { registryFile: join(dir, 'groups.json') })
     const failed = await offline.pull({ group_id: group.id, preset_id: 'se' })
     assert.equal(failed.ok, false)
-    assert.match(failed.error, /无法启动/)
+    assert.match(failed.error, /不可用/)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -337,7 +362,7 @@ await check('建群兜底：agents.create({meta:{cwd,agentPreset}}) + presets.mo
     const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
     assert.equal(created.ok, true, created.error)
     assert.equal(host.state.ensureCalls.length, 0, '没有走 sessionController')
-    assert.deepEqual(host.state.creates, [{ sessionId: created.id, cwd: 'D:\\work', preset: 'standard' }])
+    assert.deepEqual(host.state.creates, [{ sessionId: created.id, cwd: 'D:\\work', preset: 'standard', agentOptions: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' } }])
     assert.deepEqual(host.state.mounts, ['standard'], '必须把 preset 真的 mount 上')
     assert.equal((await service.state()).groups[0].owner_live, true)
   } finally { rmSync(dir, { recursive: true, force: true }) }
@@ -352,9 +377,64 @@ await check('拉人兜底：群主冷掉时用 agents.resume + presets.mount 唤
     host.state.resumePreset = 'standard'
     const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
     assert.equal(pulled.ok, true, pulled.error)
-    assert.deepEqual(host.state.resumes, [group.id])
+    assert.deepEqual(host.state.resumes.map((row) => row.id), [group.id])
     assert.deepEqual(host.state.mounts, ['standard', 'standard'], 'create 与 resume 各 mount 一次')
     assert.equal((await service.state()).groups[0].owner_live, true)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+console.log('group: 模型（agentOptions）—— 实机踩过的坑')
+await check('兜底建群必须带 agentOptions，并回报 started_via / owner_model', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost({ noController: true })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(created.ok, true, created.error)
+    assert.equal(created.started_via, 'agents.create')
+    assert.deepEqual(host.state.creates[0].agentOptions, { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' })
+    assert.equal(created.owner_model, 'deepseek-official/deepseek-flash')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('群主 agent 没有模型：建群当场失败并归档半成品会话', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost({ noController: true, omitAgentOptions: true })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(created.ok, false)
+    assert.match(created.error, /没有 provider\/model/)
+    assert.equal(host.state.archived.length, 1, '半成品会话要被归档，不留在会话列表里')
+    assert.match(String(host.state.archived[0]), /^group-/)
+    assert.deepEqual((await service.state()).groups, [], '失败时不该写进注册表')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('state 暴露 owner_model；缺失时给出明确警告', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    let row = (await service.state()).groups[0]
+    assert.equal(row.owner_model, 'deepseek-official/deepseek-flash')
+    assert.equal(row.capability_warning, undefined)
+    host.state.agents.get(group.id).options = {}
+    row = (await service.state()).groups[0]
+    assert.equal(row.owner_model, null)
+    assert.match(row.capability_warning, /没有 provider\/model/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('群主没有模型时拉人被明确拒绝（不去造一个注定失败的成员）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost()
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    host.state.agents.get(group.id).options = {}
+    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
+    assert.equal(pulled.ok, false)
+    assert.match(pulled.error, /没有 provider\/model/)
+    assert.equal(host.state.specs.length, 0, '不该启动成员')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 

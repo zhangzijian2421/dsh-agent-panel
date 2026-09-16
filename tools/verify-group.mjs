@@ -74,6 +74,8 @@ async function main() {
 	line('群 id', created.payload.id);
 	line('群名', created.payload.name);
 	line('群主 preset', created.payload.preset_id);
+	line('启动路径', created.payload.started_via);
+	line('群主模型', created.payload.owner_model);
 
 	console.log('\n[2/5] 拉人（preset=' + presetId + '）');
 	const pulled = await call('/pull', 'POST', { group_id: created.payload.id, preset_id: presetId });
@@ -97,9 +99,16 @@ async function main() {
 		process.exit(6);
 	}
 	line('群主在线', row.owner_live);
+	line('群主模型', row.owner_model);
 	line('成员数', row.members.length);
 	for (const member of row.members) line('  · ' + member.name, member.status + (member.registered ? '' : '（群主拉的）'));
 	if (row.capability_warning) line('能力告警', row.capability_warning);
+	// 到这里状态已经尘埃落定：群主 agent 没有模型就说明这个群跑不起来，验证不能算通过。
+	if (row.owner_model === null || row.owner_model === undefined) {
+		console.log('× 群主 agent 没有 provider/model：群主会报 {{model}} 无值、成员会报 no provider/model。');
+		if (!keep) await call('/group-dissolve', 'POST', { group_id: created.payload.id });
+		process.exit(7);
+	}
 
 	console.log('\n[4/5] 移出成员');
 	const released = await call('/release', 'POST', { group_id: created.payload.id, member_id: pulled.payload.member_id });

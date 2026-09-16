@@ -108,7 +108,8 @@ function makeHarness() {
 				return {
 					async ensureSession(id, cwd, check, preset) {
 						state.ensureCalls.push({ id, cwd, preset })
-						const agent = { id, cwd, preset }
+						// 真实 controller 会带 agentOptions（agentDefaultModel.currentSelection）；没有模型的 agent 是残的。
+						const agent = { id, cwd, preset, options: { provider: 'deepseek-official', model: 'deepseek-flash' } }
 						state.agents.set(id, agent)
 						state.sessions.set(id, { id, header: { cwd } })
 						return agent
@@ -166,6 +167,8 @@ await check('POST /group-create：用当前会话的 cwd 建出群主会话 + �
 	assert.equal(created.cwd, 'D:\\work', 'cwd 应从 session_id 的会话头解析出来')
 	groupId = created.id
 	assert.deepEqual(harness.state.ensureCalls, [{ id: created.id, cwd: 'D:\\work', preset: 'standard' }])
+	assert.equal(created.started_via, 'sessionController', '首选 GUI 自己的启动路径')
+	assert.equal(created.owner_model, 'deepseek-official/deepseek-flash', '群主 agent 必须有 provider/model')
 	assert.equal(harness.state.titles[0].title, '群聊 · 1')
 	assert.equal(existsSync(registryFile), true, '注册表应落在临时 HOME 下')
 	const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
@@ -207,6 +210,7 @@ await check('GET /state：群、成员状态、preset 列表、默认群主 pres
 	assert.equal(row.members[0].status, 'running', '原生子代理行被判为 running')
 	assert.equal(row.members[0].registered, true)
 	assert.equal(row.preset_id, 'standard')
+	assert.equal(row.owner_model, 'deepseek-official/deepseek-flash')
 	assert.equal(snapshot.presets.length, 3)
 })
 await check('GET /members?sessionId=：@ 菜单源拿到本会话成员', async () => {
