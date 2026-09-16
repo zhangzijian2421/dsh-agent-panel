@@ -149,6 +149,23 @@ node tools/verify-group.mjs [--keep] [--cwd <dir>] [--preset <id>]
 
 ---
 
+## 回滚
+
+v2 是一次不兼容重写（群聊从"会话的一个属性"变成"独立会话"）。要退回 v1：
+
+```bash
+git -C <本包目录> checkout 75d52bc      # v1.5.1（空会话拉人修复版）
+# 或退回 v2 之前：git checkout 5972082^
+```
+
+然后重启 DSH + 硬刷新页面。**回滚不需要清任何东西**：v2 的注册表在
+`~/.dsh/dsh-agent-panel/groups.json`，v1 完全不读它；v1 的 workspace 群目录 v2 也不读——
+两代状态互不干扰。想彻底清干净，删掉 `~/.dsh/dsh-agent-panel/` 与工作区里的 `.agent-group/` 即可。
+
+---
+
+## 目录结构
+
 ```
 lib/
   index.js      插件外壳（路由 + 模型工具 + @ 过滤安装）
@@ -156,7 +173,8 @@ lib/
   store.js      群聊注册表（纯函数 + 文件层）
   mention.js    @ 候选过滤
   client.js     浏览器半边
-test/           6 个纯 node 测试
+test/           8 个纯 node 测试
+tools/          read-session.mjs（会话日志解码）、verify-group.mjs（端到端实机验证）
 docs/
   group-above-session.md   可行性分析：为什么是"独立群主会话"、官方 team 包调研、多 preset 结论
   class-diagrams.md        v1 的类图与实例图（历史参考）
