@@ -29,28 +29,18 @@ dsh plugin --profile web add @zijians-bow-is-long/dsh-agent-panel
 
 ---
 
-## 入口与位置（v2.1）
+## 入口与位置（v2.2：空会话即群聊入口）
 
-| 入口 | 位置 | 用途 |
-| --- | --- | --- |
-| `👥 群聊`（侧边栏全局面板行） | `sidebar.panellist` id=`agent-groups` → 主面板 `main` key=`agent-groups` | **建群**（选工作区目录 + 群主 preset）、**挂到侧边栏**、拉人/移出/恢复/改名/打开/解散 |
-| `👥 群聊`（会话右上角 / 空会话 composer 上方） | `conversation.session.header.utilities` + `conversation.input.dock` | 在会话里快速拉人（下拉开面板） |
+- **新建一个空会话（＋ 新会话）**，空会话的 composer 上方会出现两个东西：
+  `👥 群聊`（打开拉人面板）和 **`＋ 创建群聊`**（旁边可选群主 preset）。
+- 点 **`＋ 创建群聊`**：这个空会话就变成群聊——群主 preset 切到所选值（原生空白会话切预设）、
+  标题改为 `👥 群聊 · N`（在侧边栏里区别于普通会话）、注册进群聊面板，然后面板自动打开让你拉人。
+- 群会话**本来就在工作区下面**（它就是一个普通会话），不需要任何"归属/挂载"操作；
+  与普通会话的区别靠标题的 👥 前缀和面板里的群标记。
+- 拉人：面板 → 选 preset → 「拉入本群」；移出/恢复/改名/解散都在面板里。
+- 会话一旦开始就不能再改群主 preset（DSH 语义：空白会话才能切预设）。
 
-**群聊出现在"左侧工作区下面"的条件**：群会话必须挂进那个工作区——DSH 的工作区持有自己的
-`sessionIds`（`Workspace.sessionIds`），没挂进去的会话不会出现在那棵树里。建群时会自动挂：
-
-1. 按群的工作目录在 `useWorkspaces` 快照里找同名工作区 → `workspaces.insertSessionBefore(workspaceId, groupId)`；
-2. 目录还不是工作区时先 `workspaces.create({ path })` 再挂；
-3. 老群（或当初没挂上的）在群聊页面点一次「挂到侧边栏」即可。
-
-> 为什么入口不在"工作区加号正下方"：侧边栏的工作区/会话整块是 `sidebar.workspaces`（**single**，
-> `replaceRisk: shadows-shipped-ui`），它下面没有任何"工作区行/加号旁"的加成槽位——要放在那儿
-> 就得整块替换它（自己重写搜索、工作区树、会话列表与所有对话框）。所以入口放在侧边栏的全局
-> 面板行，而**群列表通过上面的挂载出现在工作区下面**（与会话并列）。
-
----
-
-## 架构
+---## 架构
 
 ```
 group-<uuid>            ← 群主会话（root 会话，preset 建群时指定，默认 standard）

@@ -46,7 +46,8 @@ function makeReact() {
 }
 
 /** Run the bundle, then run `exports.apply` against a capturing slot registry. */
-function loadBundle() {
+function loadBundle(fetchImpl) {
+	const calls = [];
 	const seats = new Map();
 	let last = null;
 	const ctx = {
@@ -68,7 +69,7 @@ function loadBundle() {
 		console,
 		TextEncoder,
 		btoa: (value) => Buffer.from(value, "binary").toString("base64"),
-		fetch: () => Promise.reject(new Error("no network in this test")),
+		fetch: fetchImpl || (() => Promise.reject(new Error("no network in this test"))),
 		document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
 		window: { __ModuleLoader__: { load: (definition) => { sandbox.__definition = definition; } } }
 	};
@@ -117,15 +118,21 @@ console.log("header seat");
 console.log("dock seat — blank session (the reported bug)");
 {
 	const node = dockTrigger(blankProps);
-	check("renders a button", node !== null, String(node));
-	check("right-aligned dock row wrapper", node !== null && node.props.className === "agrp-dockrow");
-	const button = node === null ? undefined : node.children[0].type();
-	check("inner component yields a real <button>", button !== undefined && button.type === "button");
-	check(
-		"button label is 群聊",
-		button !== undefined && String(button.children[0]).includes("群聊"),
-		button === undefined ? "no button" : JSON.stringify(button.children)
-	);
+	check("renders a dock row", node !== null && node.props.className === "agrp-dockrow", String(node));
+	// 展平后找按钮（dock 行现在是 [pill, preset 选择, 创建按钮]）
+	const flat = [];
+	(function w(x) {
+		if (x === null || x === undefined || typeof x !== "object") return;
+		if (Array.isArray(x)) { x.forEach(w); return; }
+		flat.push(x);
+		(x.children || []).forEach(w);
+	})(node);
+	const pill = flat.find((el) => el.type === "button" && String(el.children[0]).indexOf("群聊") >= 0);
+	check("still renders the 群聊 pill", pill !== undefined);
+	const create = flat.find((el) => el.type === "button" && String(el.children[0]).indexOf("创建群聊") >= 0);
+	check("blank 会话出现「＋ 创建群聊」按钮", create !== undefined);
+	const select = flat.find((el) => el.type === "select");
+	check("带群主 preset 选择器", select !== undefined);
 }
 
 console.log("dock seat — started session");
@@ -143,6 +150,44 @@ console.log("dock seat — hook-sourced blank flag (owner props absent)");
 
 console.log("dock seat — no hook, no owner props");
 check("degrades to hidden rather than double-rendering", dockTrigger({ sessionId: "s" }) === null);
+
+console.log("dock seat — 创建群聊流程（空会话点按钮 → POST /group-create → 面板打开）");
+{
+	const calls = [];
+	const fetchImpl = (path, options) => {
+		const method = options && options.method ? options.method : "GET";
+		let body;
+		try { body = options && options.body ? JSON.parse(options.body) : undefined; } catch (error) { body = undefined; }
+		calls.push({ path, method, body });
+		const payload = path.indexOf("/group-create") >= 0
+			? { ok: true, id: "session-blank-1", name: "群聊 · 1", preset_id: "standard", title: "👥 群聊 · 1" }
+			: { default_group_preset: "standard", presets: [{ id: "standard", name: "标准模式" }], groups: [] };
+		return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
+	};
+	const seats2 = loadBundle(fetchImpl);
+	const dock = seats2.get("conversation.input.dock")(blankProps);
+	const flat = [];
+	(function w(x) {
+		if (x === null || x === undefined || typeof x !== "object") return;
+		if (Array.isArray(x)) { x.forEach(w); return; }
+		flat.push(x);
+		(x.children || []).forEach(w);
+	})(dock);
+	const create = flat.find((el) => el.type === "button" && String(el.children[0]).indexOf("创建群聊") >= 0);
+	check("创建群聊按钮存在（空白会话 dock 行）", create !== undefined);
+	check("preset 选择器存在", flat.some((el) => el.type === "select"));
+	const overlaySeat = seats2.get("shell.overlay");
+	create.props.onClick();
+	await new Promise((resolve) => setImmediate(resolve));
+	const call = calls.find((c) => c.path.indexOf("/group-create") >= 0);
+	check("POST /group-create 带 session_id 与 preset_id", call !== undefined && call.method === "POST" && call.body.session_id === "session-blank" && call.body.preset_id === "standard");
+	const overlay = overlaySeat(overlaySeatBlankProps());
+	check("建群后面板自动打开（可继续拉人）", overlay !== null);
+}
+
+function overlaySeatBlankProps() {
+	return { sessionId: "session-blank-1", useSessions: (selector) => selector({ byId: { "session-blank-1": { blank: false } } }) };
+}
 
 if (failures > 0) {
 	console.log("\n" + failures + " check(s) failed");

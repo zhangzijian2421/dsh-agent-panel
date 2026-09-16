@@ -10,11 +10,9 @@ import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import {
   DEFAULT_GROUP_PRESET,
-  GROUP_ID_PREFIX,
   activeMembers,
   dedupeName,
   emptyRegistry,
-  isGroupId,
   markMemberRemoved,
   markMemberRestored,
   nextGroupName,
@@ -54,16 +52,6 @@ function group(id, overrides) {
     ...(overrides || {})
   }
 }
-
-console.log('store: identity')
-check('群 id 前缀', () => {
-  assert.equal(isGroupId(GROUP_ID_PREFIX + 'abc'), true)
-  assert.equal(isGroupId('session-abc'), false)
-  assert.equal(isGroupId(undefined), false)
-})
-check('注册表路径落在 ~/.dsh/dsh-agent-panel/ 下', () => {
-  assert.equal(registryPath('C:\\home'), join('C:\\home', '.dsh', 'dsh-agent-panel', 'groups.json'))
-})
 
 console.log('store: parse / serialize')
 check('空文本 → 空注册表', () => {

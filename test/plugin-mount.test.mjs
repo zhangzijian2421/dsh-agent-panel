@@ -75,16 +75,15 @@ await check('身份：name 与 inject', () => {
 	assert.equal(name, 'dsh-agent-panel')
 	assert.deepEqual(inject, ['webServer'])
 })
-await check('注册 9 条 exact 路由 + 2 个模型工具', () => {
+await check('注册 8 条 exact 路由 + 2 个模型工具', () => {
 	const { routes, tools } = mount()
-	assert.equal(routes.length, 9)
+	assert.equal(routes.length, 8)
 	for (const route of routes) {
 		assert.equal(route.kind, 'exact')
 		assert.equal(typeof route.path, 'string')
 		assert.equal(typeof route.handler, 'function')
 	}
 	assert.deepEqual(routes.map((route) => route.path).sort(), [
-		'/api/dsh-agent-panel/group-attach',
 		'/api/dsh-agent-panel/group-create',
 		'/api/dsh-agent-panel/group-dissolve',
 		'/api/dsh-agent-panel/group-rename',
@@ -164,7 +163,7 @@ await check('坏 JSON 体不炸：当成空参数处理', async () => {
 	assert.equal(captured.status, 200)
 	const payload = JSON.parse(captured.body)
 	assert.equal(payload.ok, false)
-	assert.match(payload.error, /工作目录/)
+	assert.match(payload.error, /需要 session_id|没有工作目录|工作目录/)
 	assert.equal(tools.length, 2)
 })
 
@@ -186,14 +185,14 @@ await check('黑名单里属于本包的 tool 名必须真的注册过（防 v1 
 console.log('plugin shell: mention filter hook')
 await check('resolver 缺席时返回 undefined（交给 inject 等待）', () => {
 	const { routes } = mount()
-	assert.equal(routes.length, 9)
+	assert.equal(routes.length, 8)
 	assert.equal(installMentionFilter({ get: () => undefined }), undefined)
 })
 await check('resolver 就位时安装可回滚的过滤', async () => {
 	const original = async () => [{ sessionId: 'a' }, { sessionId: 'b' }]
 	const resolver = { listCandidates: original, ctx: { sessionQuery: { listSessions: async () => [] } } }
 	const { routes } = mount({ resolver })
-	assert.equal(routes.length, 9)
+	assert.equal(routes.length, 8)
 	assert.notEqual(resolver.listCandidates, original, '实例方法被替换')
 	const rows = await resolver.listCandidates({ id: 'me' }, '', 10, undefined)
 	assert.equal(rows.length, 2)

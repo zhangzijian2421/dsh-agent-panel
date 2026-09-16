@@ -1,14 +1,17 @@
 /**
- * 群聊服务单测：用桩 ctx 驱动一整套 建群 / 拉人 / 状态 / 移除 / 恢复 / 解散 流程。
+ * 群聊服务单测（v2.2：**空会话变成群聊**）。
  *
- * 重点是钉住 v2 的语义（这些正是旧实现里最容易回归的地方）：
- *   - 群 = 一个 root 群主会话（id 带 `group-` 前缀），preset 建群时确定
- *   - 成员 = 具名常驻子代理：label 去重、persona 来自被拉 preset、黑名单来自 MEMBER_TOOL_DENY、maxDepth=1
- *   - 名册 = 原生子代理目录（含"不是本面板拉的"成员，也要看得见）
- *   - 移除 = 原生 release + 注册表软删除；恢复 = 撤销软删除
- *   - 能力面 = 群主 preset；minimal 群主必须给出显式告警
+ * 钉住的语义：
+ *   - 建群必须给 `session_id`：群 = 那个空会话本身（它本来就在工作区下面，无需归属操作）；
+ *   - 先按会话自己的 preset 启动（adopt/resume，不与记录冲突），再用原生
+ *     `agentPresets.select` 换成用户选的 preset——只有空白会话能换（非空白会抛 locked，
+ *     此时保留原 preset 并在结果里如实说明）；
+ *   - 标题加 👥 前缀，在侧边栏里区别于普通会话；
+ *   - 拉人 = 群主会话下的具名常驻子代理（persona 来自被拉 preset，黑名单 + maxDepth=1）；
+ *   - `state()` 报告群、成员（含"群主拉的"未注册成员）与能力面告警；
+ *   - 解散 = 释放成员 + 归档会话 + 清注册表。
  */
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -27,593 +30,431 @@ import {
 import { readRegistryFile } from '../lib/store.js'
 
 const results = []
-function check(name, fn) {
-  return Promise.resolve()
-    .then(fn)
-    .then(() => { results.push({ name, ok: true }); console.log('  ok   ' + name) })
-    .catch((error) => { results.push({ name, ok: false }); console.log('  FAIL ' + name + ' → ' + String((error && error.message) || error)) })
+async function check(label, fn) {
+	try {
+		await fn()
+		results.push({ label, ok: true })
+		console.log('  ok   ' + label)
+	} catch (error) {
+		results.push({ label, ok: false })
+		console.log('  FAIL ' + label + ' → ' + String((error && error.message) || error))
+	}
 }
 
 const PRESETS = [
-  { id: 'standard', name: '标准模式', description: '完整编码 agent', trust: 'system' },
-  { id: 'minimal', name: '极简模式', description: '只有 shell', trust: 'system' },
-  { id: 'se', name: 'SE 需求分析', description: '需求分析', trust: 'user' }
+	{ id: 'standard', name: '标准模式', description: '完整编码 agent', trust: 'system' },
+	{ id: 'minimal', name: '极简模式', description: '只有 shell', trust: 'system' },
+	{ id: 'se', name: 'SE 需求分析', description: '只做需求分析', trust: 'user' }
 ]
-const DOCS = {
-  se: [
-    '- id: persona',
-    '  prefix: |',
-    '    你是 SE，只做需求分析与方案设计。',
-    '    绝对不要写实现代码。',
-    '',
-    '- id: tools',
-    '  mode: standard'
-  ].join('\n')
-}
+const SE_DOC = [
+	'- id: persona',
+	'  prefix: |',
+	'    你是 SE，只做需求分析与方案设计。',
+	'- id: tools',
+	'  mode: standard'
+].join('\n')
 
-/** 搭一个只实现本服务真正用到的那几个方法的假宿主。 */
+/** 桩宿主：只实现本服务真正用到的方法。 */
 function makeHost(options) {
-  const state = {
-    agents: new Map(),
-    children: new Map(),
-    sessions: new Map(),
-    titles: new Map(),
-    archived: [],
-    specs: [],
-    ensureCalls: [],
-    creates: [],
-    resumes: [],
-    mounts: [],
-    drained: [],
-    startFails: (options && options.startFails) || null,
-    omitAgentOptions: (options && options.omitAgentOptions) === true,
-    workspaces: [],
-    resumePreset: (options && options.resumePreset) || null,
-    resumeCwd: (options && options.resumeCwd) || null
-  }
-  let started = 0
-  const ctx = {
-    get(name) {
-      if (name === 'agents') {
-        return {
-          get: (id) => state.agents.get(id),
-          async create(options) {
-            state.creates.push({ sessionId: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset, agentOptions: options.agentOptions })
-            if (typeof options.setup === 'function') await options.setup({ label: 'agentCtx' })
-            const agent = {
-              id: options.sessionId,
-              cwd: options.meta.cwd,
-              preset: options.meta.agentPreset,
-              // 真实宿主里 agent.options 带 provider/model；没有它 agent 是残的（见 defaultAgentOptions 的注释）。
-              options: state.omitAgentOptions === true ? {} : (options.agentOptions || { provider: 'deepseek-official', model: 'deepseek-flash' })
-            }
-            state.agents.set(agent.id, agent)
-            state.sessions.set(agent.id, { id: agent.id })
-            return { agent }
-          },
-          async resume(options) {
-            state.resumes.push({ id: options.resumeSessionId, agentOptions: options.agentOptions })
-            if (typeof options.setup === 'function') await options.setup({ label: 'agentCtx' })
-            const agent = {
-              id: options.resumeSessionId,
-              cwd: state.resumeCwd || 'D:\\work',
-              preset: state.resumePreset || 'standard',
-              options: options.agentOptions || { provider: 'deepseek-official', model: 'deepseek-flash' }
-            }
-            state.agents.set(agent.id, agent)
-            state.sessions.set(agent.id, { id: agent.id })
-            return { agent }
-          }
-        }
-      }
-      if (name === 'workspaceRegistry') {
-        return {
-          list: () => state.workspaces,
-          get: (id) => state.workspaces.find((item) => String(item.id) === String(id)),
-          async archiveSession(id) { state.archived.push(id) }
-        }
-      }
-      if (name === 'agentDefaultModel') {
-        return {
-          currentSelection: () => ({ provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' })
-        }
-      }
-      if (name === 'subagents') {
-        return {
-          async listChildren(id) { return state.children.get(id) || [] },
-          async startContinuable(spec) {
-            if (state.startFails !== null) {
-              const failure = state.startFails
-              state.startFails = null
-              throw new Error(failure)
-            }
-            state.specs.push(spec)
-            started += 1
-            const childId = 'child-' + started
-            return { childId, messageId: 'msg-' + started }
-          },
-          async drainContinuableChildren(parent, ids) { state.drained.push({ parent: parent.id, ids: [...ids] }) }
-        }
-      }
-      if (name === 'agentPresets') {
-        return {
-          async list() { return PRESETS },
-          async read(id) { return DOCS[id] || '' },
-          async mount(agentCtx, id) { state.mounts.push(id); return { id } }
-        }
-      }
-      if (name === 'sessions') {
-        return { get: (id) => state.sessions.get(id) }
-      }
-      if (name === 'sessionController' && !(options && options.noController)) {
-        return {
-          async ensureSession(id, cwd, check, preset) {
-            state.ensureCalls.push({ id, cwd, check, preset })
-            // 真实实现里 agentOptions 由 controller 自己带上（agentDefaultModel.currentSelection）。
-            const agent = {
-              id,
-              cwd,
-              preset,
-              options: state.omitAgentOptions === true ? {} : { provider: 'deepseek-official', model: 'deepseek-flash' }
-            }
-            state.agents.set(id, agent)
-            state.sessions.set(id, { id })
-            return agent
-          }
-        }
-      }
-      if (name === 'sessionTitle') {
-        return { rename: (session, title) => { state.titles.set(session.id, title) } }
-      }
-      if (name === 'workspaceRegistry') {
-        return { async archiveSession(id) { state.archived.push(id) } }
-      }
-      return undefined
-    }
-  }
-  return { ctx, state }
+	const state = {
+		agents: new Map(),
+		children: new Map(),
+		sessions: new Map(),
+		titles: [],
+		archived: [],
+		specs: [],
+		ensureCalls: [],
+		creates: [],
+		resumes: [],
+		selects: [],
+		drained: [],
+		startFails: (options && options.startFails) || null,
+		selectFails: (options && options.selectFails) || null,
+		presetByAgent: new Map()
+	}
+	let child = 0
+	function makeAgent(id, cwd, preset) {
+		return {
+			id,
+			ctx: { agentId: id },
+			options: { provider: 'deepseek-official', model: 'deepseek-flash' },
+			session: { header: { cwd, agentPreset: preset } }
+		}
+	}
+	const ctx = {
+		get(name) {
+			if (name === 'agents') {
+				return {
+					get: (id) => state.agents.get(id),
+					async create(options2) {
+						state.creates.push({ sessionId: options2.sessionId, cwd: options2.meta.cwd, preset: options2.meta.agentPreset, agentOptions: options2.agentOptions })
+						if (typeof options2.setup === 'function') await options2.setup({ agentId: options2.sessionId })
+						const agent = makeAgent(options2.sessionId, options2.meta.cwd, options2.meta.agentPreset)
+						state.agents.set(agent.id, agent)
+						state.sessions.set(agent.id, { id: agent.id, header: { cwd: options2.meta.cwd, agentPreset: options2.meta.agentPreset } })
+						return { agent }
+					},
+					async resume(options2) {
+						state.resumes.push({ id: options2.resumeSessionId, agentOptions: options2.agentOptions })
+						if (typeof options2.setup === 'function') await options2.setup({ agentId: options2.resumeSessionId })
+						const agent = makeAgent(options2.resumeSessionId, 'D:\\work', 'standard')
+						state.agents.set(agent.id, agent)
+						return { agent }
+					}
+				}
+			}
+			if (name === 'subagents') {
+				return {
+					async listChildren(id) { return state.children.get(id) || [] },
+					async startContinuable(spec) {
+						if (state.startFails !== null) {
+							const failure = state.startFails
+							state.startFails = null
+							throw new Error(failure)
+						}
+						state.specs.push(spec)
+						child += 1
+						const childId = 'child-' + child
+						const rows = state.children.get(spec.request.parent.id) || []
+						rows.push({ kind: 'child', id: childId, label: spec.label, activity: 'running', mode: 'continuable' })
+						state.children.set(spec.request.parent.id, rows)
+						return { childId, messageId: 'msg-' + child }
+					},
+					async drainContinuableChildren(parent, ids) {
+						state.drained.push({ parent: parent.id, ids: [...ids] })
+						const rows = (state.children.get(parent.id) || []).filter((row) => ids.indexOf(row.id) < 0)
+						state.children.set(parent.id, rows)
+					}
+				}
+			}
+			if (name === 'agentPresets') {
+				return {
+					async list() { return PRESETS },
+					async read(id) { return id === 'se' ? SE_DOC : '' },
+					async mount(agentCtx, id) { state.presetByAgent.set(String(agentCtx.agentId), String(id)); return { id } },
+					composedPreset(agentCtx) { return state.presetByAgent.get(String(agentCtx.agentId)) || null },
+					async select(agent, id) {
+						if (state.selectFails !== null) {
+							const failure = state.selectFails
+							state.selectFails = null
+							throw new Error(failure)
+						}
+						state.selects.push({ agent: String(agent.id), preset: String(id) })
+						state.presetByAgent.set(String(agent.id), String(id))
+						return String(id)
+					}
+				}
+			}
+			if (name === 'sessions') {
+				return { get: (id) => state.sessions.get(id) }
+			}
+			if (name === 'sessionController') {
+				return {
+					async ensureSession(id, cwd, check, preset) {
+						state.ensureCalls.push({ id, cwd, check, preset })
+						const agent = makeAgent(id, cwd, preset)
+						state.agents.set(id, agent)
+						state.sessions.set(id, { id, header: { cwd, agentPreset: preset } })
+						state.presetByAgent.set(id, String(preset))
+						return agent
+					}
+				}
+			}
+			if (name === 'workspaceRegistry') {
+				return {
+					list: () => [],
+					get: () => undefined,
+					async archiveSession(id) { state.archived.push(id) }
+				}
+			}
+			if (name === 'sessionTitle') {
+				return { rename: (session, title) => { state.titles.push({ id: session.id, title }) } }
+			}
+			return undefined
+		}
+	}
+	return { state, ctx }
 }
 
-console.log('group: pure helpers')
+console.log('group: 纯函数')
 await check('mapChildRows 只保留 child，边角字段有兜底', () => {
-  const rows = mapChildRows([
-    { kind: 'child', id: 'c1', label: 'SE', activity: 'running', mode: 'continuable' },
-    { kind: 'child', id: 'c2', activity: 'inactive', mode: 'one-shot' },
-    { kind: 'parent', id: 'p1' },
-    null
-  ])
-  assert.equal(rows.length, 2)
-  assert.deepEqual(rows[0], { id: 'c1', name: 'SE', status: 'running', mode: 'continuable' })
-  assert.deepEqual(rows[1], { id: 'c2', name: 'c2', status: 'idle', mode: 'one-shot' })
+	const rows = mapChildRows([
+		{ kind: 'child', id: 'c1', label: 'SE', activity: 'running', mode: 'continuable' },
+		{ kind: 'child', id: 'c2', activity: 'inactive', mode: 'one-shot' },
+		{ kind: 'parent', id: 'p1' },
+		null
+	])
+	assert.equal(rows.length, 2)
+	assert.deepEqual(rows[0], { id: 'c1', name: 'SE', status: 'running', mode: 'continuable' })
+	assert.deepEqual(rows[1], { id: 'c2', name: 'c2', status: 'idle', mode: 'one-shot' })
 })
 await check('memberNotice 交代群名、群主 id 与汇报方式', () => {
-  const text = memberNotice({ groupName: '群聊 · 1', memberName: 'SE', groupId: 'group-abc' })
-  assert.match(text, /群聊 · 1/)
-  assert.match(text, /SE/)
-  assert.match(text, /send_message\(agent_id="group-abc"\)/)
-  assert.match(text, /兄弟会话/)
+	const text = memberNotice({ groupName: '群聊 · 1', memberName: 'SE', groupId: 'group-abc' })
+	assert.match(text, /群聊 · 1/)
+	assert.match(text, /SE/)
+	assert.match(text, /send_message\(agent_id="group-abc"\)/)
+	assert.match(text, /兄弟会话/)
 })
 await check('capabilityWarning 只对 minimal 群主报警', () => {
-  assert.equal(capabilityWarning('standard'), undefined)
-  assert.equal(capabilityWarning('cordis'), undefined)
-  assert.match(capabilityWarning('minimal'), /read\/write\/edit/)
+	assert.equal(capabilityWarning('standard'), undefined)
+	assert.equal(capabilityWarning('cordis'), undefined)
+	assert.match(capabilityWarning('minimal'), /read\/write\/edit/)
 })
 await check('knownToolNamesFrom 从 restrict 报错里解析工具域', () => {
-  const names = knownToolNamesFrom('tools.restrict() names unknown global tools: read, write, list_agents')
-  assert.deepEqual([...names].sort(), ['list_agents', 'read', 'write'])
-  assert.equal(knownToolNamesFrom('完全不相干的报错'), undefined)
+	const names = knownToolNamesFrom('tools.restrict() names unknown global tools: read, write, list_agents')
+	assert.deepEqual([...names].sort(), ['list_agents', 'read', 'write'])
+	assert.equal(knownToolNamesFrom('完全不相干的报错'), undefined)
 })
 await check('parsePersonaPrefix 支持 | 与 > 块标量，并按下一个顶层条目收尾', () => {
-  assert.equal(parsePersonaPrefix(DOCS.se), '你是 SE，只做需求分析与方案设计。\n绝对不要写实现代码。')
-  const folded = ['- id: persona', '  prefix: >-', '    第一行', '    第二行', '- id: tools'].join('\n')
-  assert.equal(parsePersonaPrefix(folded), '第一行 第二行')
-  assert.equal(parsePersonaPrefix('- id: tools\n  mode: standard'), null)
+	assert.equal(parsePersonaPrefix(SE_DOC), '你是 SE，只做需求分析与方案设计。')
+	const folded = ['- id: persona', '  prefix: >-', '    第一行', '    第二行', '- id: tools'].join('\n')
+	assert.equal(parsePersonaPrefix(folded), '第一行 第二行')
+	assert.equal(parsePersonaPrefix('- id: tools\n  mode: standard'), null)
 })
 await check('extractPersona：有 persona 用 persona，读不到就退化成元数据身份', async () => {
-  const source = { read: async (id) => DOCS[id] || '', list: async () => PRESETS }
-  assert.match(await extractPersona(source, 'se'), /只做需求分析/)
-  const fallback = await extractPersona({ read: async () => { throw new Error('nope') }, list: async () => PRESETS }, 'se')
-  assert.match(fallback, /SE 需求分析/)
-  assert.match(fallback, /preset "se"/)
+	const source = { read: async (id) => (id === 'se' ? SE_DOC : ''), list: async () => PRESETS }
+	assert.match(await extractPersona(source, 'se'), /只做需求分析/)
+	const fallback = await extractPersona({ read: async () => { throw new Error('nope') }, list: async () => PRESETS }, 'se')
+	assert.match(fallback, /SE 需求分析/)
+	assert.match(fallback, /preset "se"/)
 })
 await check('makeSignal 满足 startContinuable 的鸭子类型要求', () => {
-  const signal = makeSignal()
-  assert.equal(signal.aborted, false)
-  assert.doesNotThrow(() => signal.throwIfAborted())
-  let fired = 0
-  const listener = () => { fired += 1 }
-  signal.addEventListener('abort', listener)
-  signal.removeEventListener('abort', listener)
-  assert.equal(fired, 0)
+	const signal = makeSignal()
+	assert.equal(signal.aborted, false)
+	assert.doesNotThrow(() => signal.throwIfAborted())
 })
 
-console.log('group: createGroup')
-await check('建群：root 会话 + 指定 preset + 标题 + 注册表', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const file = join(dir, 'groups.json')
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: file })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(created.ok, true)
-    assert.match(created.id, /^group-/)
-    assert.equal(created.name, '群聊 · 1')
-    assert.equal(host.state.ensureCalls.length, 1)
-    assert.deepEqual(host.state.ensureCalls[0], { id: created.id, cwd: 'D:\\work', check: true, preset: 'standard' })
-    assert.equal(host.state.titles.get(created.id), '群聊 · 1')
-    const registry = readRegistryFile(file)
-    assert.equal(registry.groups[created.id].presetId, 'standard')
-    const second = await service.createGroup({ cwd: 'D:\\work' })
-    assert.equal(second.name, '群聊 · 2', '第二个群自动换名')
-    assert.equal(second.preset_id, 'standard', '默认群主 preset')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+console.log('group: 建群（空会话 → 群聊）')
+await check('建群：启动空会话 + 原生 select 换 preset + 👥 标题 + 注册表', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		// 用户先建一个空会话（GUI 默认 minimal），再点「创建群聊」并选 standard。
+		host.state.sessions.set('session-blank', { id: 'session-blank', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const created = await service.createGroup({ session_id: 'session-blank', preset_id: 'standard' })
+		assert.equal(created.ok, true, created.error)
+		assert.equal(created.id, 'session-blank', '群 = 这个空会话本身')
+		assert.equal(created.name, '群聊 · 1')
+		assert.equal(created.title, '👥 群聊 · 1', '侧边栏标题带 👥 前缀')
+		assert.equal(created.preset_id, 'standard')
+		assert.equal(created.preset_error, undefined)
+		assert.deepEqual(host.state.ensureCalls, [{ id: 'session-blank', cwd: 'D:\\work', check: true, preset: 'minimal' }], '先按会话自己的 preset 启动')
+		assert.deepEqual(host.state.selects, [{ agent: 'session-blank', preset: 'standard' }], '再用空白特权换成所选 preset')
+		assert.deepEqual(host.state.titles, [{ id: 'session-blank', title: '👥 群聊 · 1' }])
+		const registry = JSON.parse(readFileSync(join(dir, 'groups.json'), 'utf8'))
+		assert.equal(registry.groups['session-blank'].presetId, 'standard')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
-await check('建群失败路径：缺 cwd / preset 不存在', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    assert.equal((await service.createGroup({})).ok, false)
-    const bad = await service.createGroup({ cwd: 'D:\\work', preset_id: 'nope' })
-    assert.equal(bad.ok, false)
-    assert.match(bad.error, /preset 不存在/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+await check('建群失败路径：缺 session_id / 会话不存在 / 会话无 cwd / preset 不存在', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const noSession = await service.createGroup({ preset_id: 'standard' })
+		assert.equal(noSession.ok, false)
+		assert.match(noSession.error, /需要 session_id/)
+		const ghost = await service.createGroup({ session_id: 'session-nope', preset_id: 'standard' })
+		assert.equal(ghost.ok, false)
+		assert.match(ghost.error, /会话不存在/)
+		host.state.sessions.set('session-nocwd', { id: 'session-nocwd', header: {} })
+		const noCwd = await service.createGroup({ session_id: 'session-nocwd', preset_id: 'standard' })
+		assert.equal(noCwd.ok, false)
+		assert.match(noCwd.error, /没有工作目录/)
+		host.state.sessions.set('session-p', { id: 'session-p', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const badPreset = await service.createGroup({ session_id: 'session-p', preset_id: 'ghost' })
+		assert.equal(badPreset.ok, false)
+		assert.match(badPreset.error, /preset 不存在/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('非空白会话：select 被拒时保留原 preset 并如实说明', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost({ selectFails: 'agent-preset/locked: the session has already started' })
+		host.state.sessions.set('session-started', { id: 'session-started', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const created = await service.createGroup({ session_id: 'session-started', preset_id: 'standard' })
+		assert.equal(created.ok, true, created.error)
+		assert.equal(created.preset_id, 'minimal', '保留会话原有 preset')
+		assert.match(created.preset_error, /locked/)
+		const registry = JSON.parse(readFileSync(join(dir, 'groups.json'), 'utf8'))
+		assert.equal(registry.groups['session-started'].presetId, 'minimal')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-console.log('group: pull')
+console.log('group: 拉人')
+async function setupGroup() {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	const host = makeHost()
+	const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+	// 空会话是 GUI 建的（默认 minimal）；建群把它变成群聊。
+	host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+	const created = await service.createGroup({ session_id: 'session-g', preset_id: 'standard', name: '验证群' })
+	if (created.ok !== true) throw new Error('setup 失败: ' + created.error)
+	return { dir, host, service, groupId: created.id, created }
+}
 await check('拉人：label/persona/黑名单/maxDepth 与注册表都正确', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const file = join(dir, 'groups.json')
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: file })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
-    assert.equal(pulled.ok, true)
-    assert.equal(pulled.member_id, 'child-1')
-    assert.equal(host.state.specs.length, 1)
-    const spec = host.state.specs[0]
-    assert.equal(spec.provider, 'spawn')
-    assert.equal(spec.label, 'SE 需求分析')
-    assert.equal(spec.request.maxDepth, 1)
-    assert.equal(spec.request.parent.id, group.id, '成员挂在群主会话下')
-    assert.deepEqual(spec.request.toolFilter.deny, MEMBER_TOOL_DENY)
-    assert.match(spec.request.persona, /只做需求分析/, 'persona 来自被拉 preset')
-    assert.ok(spec.request.persona.includes('send_message(agent_id="' + group.id + '")'), 'persona 附带群规')
-    assert.match(spec.request.prompt[0].text, /欢迎「SE 需求分析」/)
-    assert.ok(spec.signal && typeof spec.signal.throwIfAborted === 'function')
-    const registry = readRegistryFile(file)
-    assert.equal(registry.groups[group.id].members[0].presetId, 'se')
-    assert.match(pulled.capability, /群主 preset（standard）/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { dir: dir2, host, service, groupId } = await setupGroup()
+		const pulled = await service.pull({ group_id: groupId, preset_id: 'se' })
+		assert.equal(pulled.ok, true, pulled.error)
+		assert.equal(pulled.member_id, 'child-1')
+		assert.equal(pulled.name, 'SE 需求分析')
+		const spec = host.state.specs[0]
+		assert.equal(spec.provider, 'spawn')
+		assert.equal(spec.request.parent.id, groupId, '成员挂在群主会话下')
+		assert.equal(spec.request.maxDepth, 1)
+		assert.deepEqual(spec.request.toolFilter.deny, MEMBER_TOOL_DENY)
+		assert.match(spec.request.persona, /只做需求分析/)
+		assert.match(spec.request.prompt[0].text, /欢迎「SE 需求分析」/)
+		assert.ok(spec.signal && typeof spec.signal.throwIfAborted === 'function')
+		const registry = JSON.parse(readFileSync(join(dir2, 'groups.json'), 'utf8'))
+		assert.equal(registry.groups[groupId].members[0].presetId, 'se')
+		assert.match(pulled.capability, /群主 preset（standard）/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('同名成员自动退避 -2；显式重名直接拒绝', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const first = await service.pull({ group_id: group.id, preset_id: 'se' })
-    const second = await service.pull({ group_id: group.id, preset_id: 'se' })
-    assert.equal(first.name, 'SE 需求分析')
-    assert.equal(second.name, 'SE 需求分析-2')
-    const clash = await service.pull({ group_id: group.id, preset_id: 'se', name: 'SE 需求分析' })
-    assert.equal(clash.ok, false)
-    assert.match(clash.error, /已被占用/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { service, groupId } = await setupGroup()
+		const first = await service.pull({ group_id: groupId, preset_id: 'se' })
+		const second = await service.pull({ group_id: groupId, preset_id: 'se' })
+		assert.equal(first.name, 'SE 需求分析')
+		assert.equal(second.name, 'SE 需求分析-2')
+		const clash = await service.pull({ group_id: groupId, preset_id: 'se', name: 'SE 需求分析' })
+		assert.equal(clash.ok, false)
+		assert.match(clash.error, /已被占用/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('降级：工具域不认全部黑名单时按解析结果裁剪并出告警', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost({ startFails: 'tools.restrict() names unknown global tools: pwsh, list_agents, interrupt_agent, ask_user_question' })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
-    assert.equal(pulled.ok, true)
-    assert.deepEqual(host.state.specs[0].request.toolFilter.deny, ['list_agents', 'interrupt_agent', 'ask_user_question'])
-    assert.match(pulled.warning, /黑名单已裁剪/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost({ startFails: 'tools.restrict() names unknown global tools: pwsh, list_agents, interrupt_agent, ask_user_question' })
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const group = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard' })
+		const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
+		assert.equal(pulled.ok, true, JSON.stringify(pulled))
+		assert.deepEqual(host.state.specs[0].request.toolFilter.deny, ['list_agents', 'interrupt_agent', 'ask_user_question'])
+		assert.match(pulled.warning, /黑名单已裁剪/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('拉人失败路径：群不存在 / preset 不存在 / 群主起不来', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    assert.equal((await service.pull({ group_id: 'group-nope', preset_id: 'se' })).ok, false)
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal((await service.pull({ group_id: group.id, preset_id: 'ghost' })).ok, false)
-    // 群主冷掉且 controller 不可用
-    host.state.agents.clear()
-    const noController = { get: (name) => (name === 'agents' ? { get: () => undefined } : host.ctx.get(name)) }
-    const offline = createGroupService(noController, { registryFile: join(dir, 'groups.json') })
-    const failed = await offline.pull({ group_id: group.id, preset_id: 'se' })
-    assert.equal(failed.ok, false)
-    assert.match(failed.error, /不可用/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { dir: setupDir, host, service, groupId } = await setupGroup()
+		assert.equal((await service.pull({ group_id: 'group-nope', preset_id: 'se' })).ok, false)
+		assert.equal((await service.pull({ group_id: groupId, preset_id: 'ghost' })).ok, false)
+		host.state.agents.clear()
+		const noController = { get: (name) => (name === 'agents' ? { get: () => undefined } : host.ctx.get(name)) }
+		const offline = createGroupService(noController, { registryFile: join(setupDir, 'groups.json') })
+		const failed = await offline.pull({ group_id: groupId, preset_id: 'se' })
+		assert.equal(failed.ok, false)
+		assert.match(failed.error, /不可用/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-console.log('group: state')
+console.log('group: 状态')
 await check('状态：注册成员 + 原生外来成员 + minimal 告警', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    await service.pull({ group_id: group.id, preset_id: 'se' })
-    // 群主自己用 subagent 工具拉的人：不在注册表里，但面板必须看得见
-    host.state.children.set(group.id, [
-      { kind: 'child', id: 'child-1', label: 'SE 需求分析', activity: 'running', mode: 'continuable' },
-      { kind: 'child', id: 'child-9', label: '野生成员', activity: 'inactive', mode: 'continuable' }
-    ])
-    const snapshot = await service.state()
-    assert.equal(snapshot.default_group_preset, 'standard')
-    assert.equal(snapshot.presets.length, 3)
-    const row = snapshot.groups.find((item) => item.id === group.id)
-    assert.equal(row.owner_live, true)
-    assert.deepEqual(row.members.map((member) => member.id), ['child-1', 'child-9'])
-    assert.equal(row.members[0].status, 'running')
-    assert.equal(row.members[0].registered, true)
-    assert.equal(row.members[1].registered, false)
-    assert.equal(row.capability_warning, undefined)
-    const weak = await service.createGroup({ cwd: 'D:\\work', preset_id: 'minimal' })
-    const weakRow = (await service.state()).groups.find((item) => item.id === weak.id)
-    assert.match(weakRow.capability_warning, /minimal/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const group = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		await service.pull({ group_id: group.id, preset_id: 'se' })
+		host.state.children.set(group.id, [
+			{ kind: 'child', id: 'child-1', label: 'SE 需求分析', activity: 'running', mode: 'continuable' },
+			{ kind: 'child', id: 'child-9', label: '野生成员', activity: 'inactive', mode: 'continuable' }
+		])
+		const row = (await service.state()).groups.find((item) => item.id === group.id)
+		assert.equal(row.owner_live, true)
+		assert.equal(row.members.length, 2, '注册成员 + 群主自己拉的都要看得见')
+		assert.equal(row.members[0].status, 'running')
+		assert.equal(row.members[0].registered, true)
+		assert.equal(row.members[1].registered, false)
+		assert.equal(row.capability_warning, undefined)
+		host.state.sessions.set('session-weak', { id: 'session-weak', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const weak = await service.createGroup({ session_id: 'session-weak', cwd: 'D:\\work', preset_id: 'minimal', name: '弱群' })
+		const weakRow = (await service.state()).groups.find((item) => item.id === weak.id)
+		assert.match(weakRow.capability_warning, /minimal/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-console.log('group: fallback（sessionController 缺席时只靠 catalog 内原语）')
-await check('建群兜底：agents.create({meta:{cwd,agentPreset}}) + presets.mount', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost({ noController: true })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(created.ok, true, created.error)
-    assert.equal(host.state.ensureCalls.length, 0, '没有走 sessionController')
-    assert.deepEqual(host.state.creates, [{ sessionId: created.id, cwd: 'D:\\work', preset: 'standard', agentOptions: { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' } }])
-    assert.deepEqual(host.state.mounts, ['standard'], '必须把 preset 真的 mount 上')
-    assert.equal((await service.state()).groups[0].owner_live, true)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+console.log('group: 移除 / 恢复 / 解散 / 改名')
+await check('移除：释放子代理 + 软删除；恢复：撤销软删除（状态 inactive）', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { host, service, groupId, memberId } = await setupWithMember()
+		const released = await service.release({ group_id: groupId, member_id: memberId })
+		assert.equal(released.ok, true, released.error)
+		assert.equal(released.released, true)
+		assert.deepEqual(host.state.drained, [{ parent: groupId, ids: [memberId] }])
+		let row = (await service.state()).groups.find((item) => item.id === groupId)
+		assert.deepEqual(row.members, [])
+		assert.deepEqual(row.removed.map((member) => member.id), [memberId])
+		await service.restore({ group_id: groupId, member_id: memberId })
+		row = (await service.state()).groups.find((item) => item.id === groupId)
+		assert.deepEqual(row.removed, [])
+		const back = row.members.find((member) => member.id === memberId)
+		assert.equal(back.status, 'inactive', '恢复显示后成员是 inactive（原生子代理已释放）')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
-await check('拉人兜底：群主冷掉时用 agents.resume + presets.mount 唤醒', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost({ noController: true })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    host.state.agents.clear()
-    host.state.resumePreset = 'standard'
-    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
-    assert.equal(pulled.ok, true, pulled.error)
-    assert.deepEqual(host.state.resumes.map((row) => row.id), [group.id])
-    assert.deepEqual(host.state.mounts, ['standard', 'standard'], 'create 与 resume 各 mount 一次')
-    assert.equal((await service.state()).groups[0].owner_live, true)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-
-console.log('group: 模型（agentOptions）—— 实机踩过的坑')
-await check('兜底建群必须带 agentOptions，并回报 started_via / owner_model', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost({ noController: true })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(created.ok, true, created.error)
-    assert.equal(created.started_via, 'agents.create')
-    assert.deepEqual(host.state.creates[0].agentOptions, { provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'high' })
-    assert.equal(created.owner_model, 'deepseek-official/deepseek-flash')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('群主 agent 没有模型：建群当场失败并归档半成品会话', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost({ noController: true, omitAgentOptions: true })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(created.ok, false)
-    assert.match(created.error, /没有 provider\/model/)
-    assert.equal(host.state.archived.length, 1, '半成品会话要被归档，不留在会话列表里')
-    assert.match(String(host.state.archived[0]), /^group-/)
-    assert.deepEqual((await service.state()).groups, [], '失败时不该写进注册表')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('state 暴露 owner_model；缺失时给出明确警告', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    let row = (await service.state()).groups[0]
-    assert.equal(row.owner_model, 'deepseek-official/deepseek-flash')
-    assert.equal(row.capability_warning, undefined)
-    host.state.agents.get(group.id).options = {}
-    row = (await service.state()).groups[0]
-    assert.equal(row.owner_model, null)
-    assert.match(row.capability_warning, /没有 provider\/model/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('群主没有模型时拉人被明确拒绝（不去造一个注定失败的成员）', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    host.state.agents.get(group.id).options = {}
-    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
-    assert.equal(pulled.ok, false)
-    assert.match(pulled.error, /没有 provider\/model/)
-    assert.equal(host.state.specs.length, 0, '不该启动成员')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-
-console.log('group: 归属到工作区（决定群聊是否出现在侧边栏）')
-await check('建群后自动 attachSession 归属，并在响应里回报工作区', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const attached = []
-    host.state.workspaces.push({
-      id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
-      async attachSession(sessionId) { attached.push(String(sessionId)); this.sessionIds = [String(sessionId), ...this.sessionIds] }
-    })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(created.ok, true, created.error)
-    assert.deepEqual(attached, [created.id], '建群就该归属（否则不会出现在工作区下面）')
-    assert.equal(created.workspace_id, 'ws-1')
-    assert.equal(created.workspace_title, '项目A')
-    // 已归属后再建一个同名目录的群：新的会话也会被归属于同一工作区
-    const second = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(attached.length, 2)
-    assert.equal(second.workspace_title, '项目A')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('目录不是工作区：建群仍成功，但如实报告未归属', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\nowhere', preset_id: 'standard' })
-    assert.equal(created.ok, true, created.error)
-    assert.equal(created.workspace_id, undefined)
-    assert.match(created.workspace_error, /还不是工作区/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('state 暴露每群的归属工作区', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    host.state.workspaces.push({
-      id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
-      async attachSession(sessionId) { this.sessionIds = [String(sessionId), ...this.sessionIds] }
-    })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const row = (await service.state()).groups.find((item) => item.id === created.id)
-    assert.equal(row.workspace_id, 'ws-1')
-    assert.equal(row.workspace_title, '项目A')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('attach()：已归属是幂等成功，不是工作区是明确失败', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    let calls = 0
-    host.state.workspaces.push({
-      id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
-      async attachSession(sessionId) { calls += 1; this.sessionIds = [String(sessionId), ...this.sessionIds] }
-    })
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(calls, 1, '建群时已归属一次')
-    const again = await service.attach({ group_id: created.id })
-    assert.equal(again.ok, true)
-    assert.equal(again.already, true)
-    assert.equal(calls, 1, '已经归属过就不该重复调用')
-    const missing = await service.attach({ group_id: 'group-nope' })
-    assert.equal(missing.ok, false)
-    assert.match(missing.error, /群聊不存在/)
-    const elsewhere = await service.createGroup({ cwd: 'D:\\nowhere', preset_id: 'standard' })
-    const failed = await service.attach({ group_id: elsewhere.id })
-    assert.equal(failed.ok, false)
-    assert.match(failed.error, /还不是工作区/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-await check('拉人时顺手自愈：老群会在这里补上归属', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    assert.equal(created.workspace_id, undefined, '建群时还没有这个工作区')
-    const attached = []
-    host.state.workspaces.push({
-      id: 'ws-9', path: 'D:\\work', title: '项目A', sessionIds: [],
-      async attachSession(sessionId) { attached.push(String(sessionId)) }
-    })
-    const pulled = await service.pull({ group_id: created.id, preset_id: 'se' })
-    assert.equal(pulled.ok, true, pulled.error)
-    assert.deepEqual(attached, [created.id], '拉人时应把未归属的群补挂上')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
-
-console.log('group: release / restore / dissolve')
-await check('移除：释放子代理 + 软删除；恢复：撤销软删除', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
-    const released = await service.release({ group_id: group.id, member_id: pulled.member_id })
-    assert.equal(released.ok, true)
-    assert.equal(released.released, true)
-    assert.deepEqual(host.state.drained, [{ parent: group.id, ids: [pulled.member_id] }])
-    let snapshot = await service.state()
-    let row = snapshot.groups.find((item) => item.id === group.id)
-    assert.deepEqual(row.members, [], '已移除的成员不再出现在 active 名册')
-    assert.deepEqual(row.removed.map((member) => member.id), [pulled.member_id])
-    await service.restore({ group_id: group.id, member_id: pulled.member_id })
-    snapshot = await service.state()
-    row = snapshot.groups.find((item) => item.id === group.id)
-    assert.deepEqual(row.removed, [])
-    assert.equal(row.members.length, 1, '恢复的是名册显示，成员回到 active 名册')
-    assert.equal(row.members[0].status, 'inactive', '但原生子代理已被释放，所以是 inactive（这是原生语义，不是 bug）')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
-})
+async function setupWithMember() {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	const host = makeHost()
+	const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+	host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+	const created = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+	const pulled = await service.pull({ group_id: created.id, preset_id: 'se' })
+	return { dir, host, service, groupId: created.id, memberId: pulled.member_id }
+}
 await check('群主离线时移除：只标记名册并给出说明', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
-    host.state.agents.clear()
-    const released = await service.release({ group_id: group.id, member_id: pulled.member_id })
-    assert.equal(released.ok, true)
-    assert.equal(released.released, false)
-    assert.match(released.note, /未驻留/)
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { host, service, groupId, memberId } = await setupWithMember()
+		host.state.agents.clear()
+		const released = await service.release({ group_id: groupId, member_id: memberId })
+		assert.equal(released.ok, true)
+		assert.equal(released.released, false)
+		assert.match(released.note, /未驻留/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
-await check('解散：释放全部成员 + 归档会话 + 清注册表', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const a = await service.pull({ group_id: group.id, preset_id: 'se' })
-    const dissolved = await service.dissolve({ group_id: group.id })
-    assert.equal(dissolved.ok, true)
-    assert.equal(dissolved.drained, 1)
-    assert.equal(dissolved.archived, true)
-    assert.deepEqual(host.state.drained[0].ids, [a.member_id])
-    assert.deepEqual(host.state.archived, [group.id])
-    assert.deepEqual((await service.state()).groups, [])
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+await check('解散：释放成员 + 归档会话 + 清注册表', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { host, service, groupId, memberId } = await setupWithMember()
+		const dissolved = await service.dissolve({ group_id: groupId })
+		assert.equal(dissolved.ok, true, dissolved.error)
+		assert.equal(dissolved.drained, 1)
+		assert.equal(dissolved.archived, true)
+		assert.deepEqual(host.state.drained[0].ids, [memberId])
+		assert.deepEqual(host.state.archived, [groupId])
+		assert.deepEqual((await service.state()).groups, [])
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
-await check('改名：注册表与会话标题一起改', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
-    const renamed = await service.renameGroup({ group_id: group.id, name: '前端小组' })
-    assert.equal(renamed.ok, true)
-    assert.equal(host.state.titles.get(group.id), '前端小组')
-    const snapshot = await service.state()
-    assert.equal(snapshot.groups[0].name, '前端小组')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+await check('改名：注册表 + 会话标题（带 👥 前缀）一起改', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const { host, service, groupId } = await setupWithMember()
+		const renamed = await service.renameGroup({ group_id: groupId, name: '前端小组' })
+		assert.equal(renamed.ok, true)
+		const last = host.state.titles[host.state.titles.length - 1]
+		assert.equal(last.title, '👥 前端小组')
+		assert.equal((await service.state()).groups[0].name, '前端小组')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('members()：@ 菜单拿某个会话自己的常驻成员', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
-  try {
-    const host = makeHost()
-    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-    host.state.children.set('session-x', [{ kind: 'child', id: 'c1', label: 'SE', activity: 'running', mode: 'continuable' }])
-    const payload = await service.members({ sessionId: 'session-x' })
-    assert.equal(payload.ok, true)
-    assert.deepEqual(payload.members, [{ id: 'c1', name: 'SE', status: 'running', mode: 'continuable' }])
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		host.state.children.set('session-x', [{ kind: 'child', id: 'c1', label: 'SE', activity: 'running', mode: 'continuable' }])
+		const payload = await service.members({ sessionId: 'session-x' })
+		assert.equal(payload.ok, true)
+		assert.deepEqual(payload.members, [{ id: 'c1', name: 'SE', status: 'running', mode: 'continuable' }])
+	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
 const failed = results.filter((row) => !row.ok)

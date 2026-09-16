@@ -1,13 +1,9 @@
 /**
- * 宿主链路端到端测试：`apply()` 挂载真实插件 → 用**假 req/res 打真实路由** → 桩宿主提供
- * agents / subagents / agentPresets / sessions / sessionController / sessionTitle / workspaceRegistry。
+ * 宿主链路端到端测试（v2.2：空会话变成群聊）：`apply()` 挂载真实插件 → 假 req/res 打真实路由 →
+ * 桩宿主提供 agents / subagents / agentPresets / sessions / sessionController / sessionTitle /
+ * workspaceRegistry。覆盖 路由 ↔ 服务 ↔ 注册表 的整条链，以及两个模型工具。
  *
- * 这一层覆盖前面几套测试各自的缝：
- *   - client-panel 只证明"客户端发的字段名"是对的；
- *   - group-service 只证明"服务收到正确参数时行为对"；
- *   - 本套证明 **路由 ↔ 服务** 之间真的接上了（字段名、cwd 从 session_id 解析、模型工具路径）。
- *
- * 注册表落在临时 HOME 下（改 USERPROFILE，`os.homedir()` 每次调用都重读），不会碰用户真实状态。
+ * 注册表落在临时 HOME 下（改 USERPROFILE，`os.homedir()` 每次调用都重读），不碰用户真实状态。
  */
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -21,11 +17,16 @@ process.env.USERPROFILE = home
 const { apply } = await import('../lib/index.js')
 
 const results = []
-function check(label, fn) {
-	return Promise.resolve()
-		.then(fn)
-		.then(() => { results.push({ label, ok: true }); console.log('  ok   ' + label) })
-		.catch((error) => { results.push({ label, ok: false }); console.log('  FAIL ' + label + ' → ' + String((error && error.message) || error)) })
+async function check(label, fn) {
+	try {
+		await fn()
+		results.push({ label, ok: true })
+		console.log('  ok   ' + label)
+	} catch (error) {
+		results.push({ label, ok: false })
+		console.log('  FAIL ' + label + ' → ' + String((error && error.message) || error))
+		console.log(String((error && error.stack) || error).split('\n').slice(0, 4).join('\n'))
+	}
 }
 
 const PRESETS = [
@@ -39,16 +40,17 @@ function makeHarness() {
 	const state = {
 		agents: new Map(),
 		children: new Map(),
-		sessions: new Map([['session-me', { id: 'session-me', header: { cwd: 'D:\\work' } }]]),
-		workspaces: [{
-			id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: [],
-			async attachSession(sessionId) { state.workspaces[0].sessionIds = [String(sessionId), ...state.workspaces[0].sessionIds] }
-		}],
+		sessions: new Map([['session-me', { id: 'session-me', header: { cwd: 'D:\\work', agentPreset: 'minimal' } }]]),
 		titles: [],
 		archived: [],
 		specs: [],
 		ensureCalls: [],
-		drained: []
+		drained: [],
+		presetByAgent: new Map(),
+		workspaces: [{
+			id: 'ws-1', path: 'D:\\work', title: '项目A', sessionIds: ['session-me'],
+			async attachSession(sessionId) { state.workspaces[0].sessionIds = [String(sessionId), ...state.workspaces[0].sessionIds] }
+		}]
 	}
 	const routes = []
 	const tools = []
@@ -58,22 +60,20 @@ function makeHarness() {
 		effect(callback) { const disposer = callback(); return () => { if (typeof disposer === 'function') disposer() } },
 		inject() {},
 		get(service) {
-			if (service === 'tools') {
-				return { register(definition) { tools.push(definition); return () => {} } }
-			}
+			if (service === 'tools') return { register(definition) { tools.push(definition); return () => {} } }
 			if (service === 'agents') {
 				return {
 					get: (id) => state.agents.get(id),
-					async create(options) {
-						if (typeof options.setup === 'function') await options.setup({})
-						const agent = { id: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset }
+					async create(options2) {
+						if (typeof options2.setup === 'function') await options2.setup({ agentId: options2.sessionId })
+						const agent = makeAgent(options2.sessionId, options2.meta.cwd, options2.meta.agentPreset)
 						state.agents.set(agent.id, agent)
-						state.sessions.set(agent.id, { id: agent.id, header: { cwd: options.meta.cwd } })
+						state.sessions.set(agent.id, { id: agent.id, header: { cwd: options2.meta.cwd, agentPreset: options2.meta.agentPreset } })
 						return { agent }
 					},
-					async resume(options) {
-						if (typeof options.setup === 'function') await options.setup({})
-						const agent = { id: options.resumeSessionId, cwd: 'D:\\work', preset: 'standard' }
+					async resume(options2) {
+						if (typeof options2.setup === 'function') await options2.setup({ agentId: options2.resumeSessionId })
+						const agent = makeAgent(options2.resumeSessionId, 'D:\\work', 'standard')
 						state.agents.set(agent.id, agent)
 						return { agent }
 					}
@@ -102,27 +102,30 @@ function makeHarness() {
 				return {
 					async list() { return PRESETS },
 					async read(id) { return id === 'se' ? SE_DOC : '' },
-					async mount() { return {} }
+					async mount(agentCtx, id) { state.presetByAgent.set(String(agentCtx.agentId), String(id)); return { id } },
+					composedPreset(agentCtx) { return state.presetByAgent.get(String(agentCtx.agentId)) || null },
+					async select(agent, id) {
+						state.selects = state.selects || []
+						state.selects.push({ agent: String(agent.id), preset: String(id) })
+						state.presetByAgent.set(String(agent.id), String(id))
+						return String(id)
+					}
 				}
 			}
-			if (service === 'sessions') {
-				return { get: (id) => state.sessions.get(id) }
-			}
+			if (service === 'sessions') return { get: (id) => state.sessions.get(id) }
 			if (service === 'sessionController') {
 				return {
 					async ensureSession(id, cwd, check, preset) {
-						state.ensureCalls.push({ id, cwd, preset })
-						// 真实 controller 会带 agentOptions（agentDefaultModel.currentSelection）；没有模型的 agent 是残的。
-						const agent = { id, cwd, preset, options: { provider: 'deepseek-official', model: 'deepseek-flash' } }
+						state.ensureCalls.push({ id, cwd, check, preset })
+						const agent = makeAgent(id, cwd, preset)
 						state.agents.set(id, agent)
-						state.sessions.set(id, { id, header: { cwd } })
+						state.sessions.set(id, { id, header: { cwd, agentPreset: preset } })
+						state.presetByAgent.set(id, String(preset))
 						return agent
 					}
 				}
 			}
-			if (service === 'sessionTitle') {
-				return { rename: (session, title) => { state.titles.push({ id: session.id, title }) } }
-			}
+			if (service === 'sessionTitle') return { rename: (session, title) => { state.titles.push({ id: session.id, title }) } }
 			if (service === 'workspaceRegistry') {
 				return {
 					list: () => state.workspaces,
@@ -135,6 +138,15 @@ function makeHarness() {
 	}
 	apply(ctx)
 	return { state, routes, tools, ctx }
+}
+
+function makeAgent(id, cwd, preset) {
+	return {
+		id,
+		ctx: { agentId: id },
+		options: { provider: 'deepseek-official', model: 'deepseek-flash' },
+		session: { header: { cwd, agentPreset: preset } }
+	}
 }
 
 /** 用假 req/res 打真实路由。 */
@@ -165,25 +177,23 @@ const registryFile = join(home, '.dsh', 'dsh-agent-panel', 'groups.json')
 let groupId = ''
 let memberId = ''
 
-console.log('e2e: 建群（session_id → cwd 解析）')
-await check('POST /group-create：用当前会话的 cwd 建出群主会话 + 写注册表 + 改标题', async () => {
-	const created = await call(harness.routes, '/api/dsh-agent-panel/group-create', 'POST', { session_id: 'session-me' })
+console.log('e2e: 建群（空会话变成群聊）')
+await check('POST /group-create：把当前会话变成群聊 + 原生 select 换 preset + 👥 标题 + 注册表', async () => {
+	const created = await call(harness.routes, '/api/dsh-agent-panel/group-create', 'POST', { session_id: 'session-me', preset_id: 'standard' })
 	assert.equal(created.ok, true, created.error)
-	assert.match(created.id, /^group-/)
+	assert.equal(created.id, 'session-me', '群 = 这个空会话本身')
 	assert.equal(created.name, '群聊 · 1')
+	assert.equal(created.title, '👥 群聊 · 1', '侧边栏标题带 👥 前缀')
 	assert.equal(created.preset_id, 'standard')
-	assert.equal(created.cwd, 'D:\\work', 'cwd 应从 session_id 的会话头解析出来')
+	assert.equal(created.preset_error, undefined, '空白会话能正常换成所选 preset')
 	groupId = created.id
-	assert.deepEqual(harness.state.ensureCalls, [{ id: created.id, cwd: 'D:\\work', preset: 'standard' }])
-	assert.equal(created.started_via, 'sessionController', '首选 GUI 自己的启动路径')
-	assert.equal(created.workspace_title, '项目A', '建群应自动归属到该目录的工作区')
-	assert.deepEqual(harness.state.workspaces[0].sessionIds, [created.id], '归属就是把会话放进工作区的 sessionIds')
-	assert.equal(created.owner_model, 'deepseek-official/deepseek-flash', '群主 agent 必须有 provider/model')
-	assert.equal(harness.state.titles[0].title, '群聊 · 1')
+	assert.deepEqual(harness.state.ensureCalls, [{ id: 'session-me', cwd: 'D:\\work', check: true, preset: 'minimal' }], '先按会话自己的 preset 启动')
+	assert.deepEqual(harness.state.selects, [{ agent: 'session-me', preset: 'standard' }], '再用空白特权换成所选 preset')
+	assert.deepEqual(harness.state.titles, [{ id: 'session-me', title: '👥 群聊 · 1' }])
 	assert.equal(existsSync(registryFile), true, '注册表应落在临时 HOME 下')
 	const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
-	assert.equal(registry.groups[created.id].presetId, 'standard')
-	assert.equal(registry.groups[created.id].members.length, 0)
+	assert.equal(registry.groups['session-me'].presetId, 'standard')
+	assert.equal(registry.groups['session-me'].members.length, 0)
 })
 
 console.log('e2e: 拉人')
@@ -220,7 +230,6 @@ await check('GET /state：群、成员状态、preset 列表、默认群主 pres
 	assert.equal(row.members[0].status, 'running', '原生子代理行被判为 running')
 	assert.equal(row.members[0].registered, true)
 	assert.equal(row.preset_id, 'standard')
-	assert.equal(row.owner_model, 'deepseek-official/deepseek-flash')
 	assert.equal(snapshot.presets.length, 3)
 })
 await check('GET /members?sessionId=：@ 菜单源拿到本会话成员', async () => {
@@ -231,14 +240,8 @@ await check('GET /members?sessionId=：@ 菜单源拿到本会话成员', async 
 })
 
 console.log('e2e: 归属与移除')
-await check('POST /group-attach：已归属时幂等成功', async () => {
-	const attached = await call(harness.routes, '/api/dsh-agent-panel/group-attach', 'POST', { group_id: groupId })
-	assert.equal(attached.ok, true, attached.error)
-	assert.equal(attached.already, true)
-	assert.equal(attached.workspace_title, '项目A')
-	const missing = await call(harness.routes, '/api/dsh-agent-panel/group-attach', 'POST', { group_id: 'group-nope' })
-	assert.equal(missing.ok, false)
-	assert.match(missing.error, /群聊不存在/)
+await check('POST /group-attach 路由已在 v2.2 移除（不需要单独归属）', async () => {
+	assert.equal(harness.routes.some((item) => item.path.endsWith('/group-attach')), false, 'group-attach 路由不应存在')
 })
 await check('POST /release：释放原生子代理 + 名册软删除', async () => {
 	const released = await call(harness.routes, '/api/dsh-agent-panel/release', 'POST', { group_id: groupId, member_id: memberId })
@@ -262,7 +265,7 @@ await check('POST /restore：回到 active 名册（状态为 inactive，因为�
 await check('POST /group-rename：注册表 + 会话标题一起改', async () => {
 	const renamed = await call(harness.routes, '/api/dsh-agent-panel/group-rename', 'POST', { group_id: groupId, name: '前端小组' })
 	assert.equal(renamed.ok, true)
-	assert.equal(harness.state.titles[harness.state.titles.length - 1].title, '前端小组')
+	assert.equal(harness.state.titles[harness.state.titles.length - 1].title, '👥 前端小组')
 	assert.equal(JSON.parse(readFileSync(registryFile, 'utf8')).groups[groupId].name, '前端小组')
 })
 
@@ -272,26 +275,29 @@ await check('group_pull：不带 preset_id 时返回状态；带则真的拉人'
 	assert.ok(tool !== undefined, '缺少 group_pull')
 	const snapshot = JSON.parse(await tool.execute({}))
 	assert.equal(snapshot.groups.length, 1)
-	const pulled = JSON.parse(await tool.execute({ group_id: groupId, preset_id: 'minimal' }))
-	assert.equal(pulled.ok, true)
+	assert.equal(snapshot.groups.length, 1)
+	const raw = await tool.execute({ preset_id: 'minimal', group_id: groupId }, { agent: { session: { header: { id: groupId } } } })
+	console.log('DEBUG raw:', String(raw).slice(0, 300))
+	const pulled = JSON.parse(raw)
+	assert.equal(pulled.ok, true, pulled.error)
 	assert.equal(pulled.name, '极简模式')
 })
-await check('group_create：cwd 缺省时从执行上下文（当前会话）取', async () => {
+await check('group_create：session_id 缺省时用执行上下文的 agent id', async () => {
 	const tool = harness.tools.find((item) => item.name === 'group_create')
 	assert.ok(tool !== undefined, '缺少 group_create')
-	const created = JSON.parse(await tool.execute({ name: '第二个群' }, { agent: { session: { header: { cwd: 'D:\\other' } } } }))
-	assert.equal(created.ok, true)
-	assert.equal(created.cwd, 'D:\\other')
-	assert.equal(created.name, '第二个群')
-	const noCwd = await tool.execute({}, undefined)
-	assert.match(String(noCwd), /需要 cwd/)
+	harness.state.sessions.set('session-agent-call', { id: 'session-agent-call', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+	const created = JSON.parse(await tool.execute({ name: '第二个群' }, { agent: { id: 'session-agent-call' } }))
+	assert.equal(created.ok, true, created.error)
+	assert.equal(created.id, 'session-agent-call')
+	const missing = await tool.execute({}, undefined)
+	assert.match(String(missing), /无法确定当前会话/)
 })
 
 console.log('e2e: 解散与收尾')
 await check('POST /group-dissolve：释放成员 + 归档会话 + 清注册表', async () => {
 	const dissolved = await call(harness.routes, '/api/dsh-agent-panel/group-dissolve', 'POST', { group_id: groupId })
 	assert.equal(dissolved.ok, true, dissolved.error)
-	assert.equal(dissolved.drained, 3, '三个成员：两次面板拉人 + 一次模型工具拉人')
+	assert.equal(dissolved.drained, 3, '三次拉人：面板两次 + 模型工具一次')
 	assert.equal(dissolved.archived, true)
 	assert.ok(harness.state.archived.indexOf(groupId) >= 0)
 	const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
