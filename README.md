@@ -23,7 +23,9 @@
 - **一个工作区支持多个互相独立的群聊**：每个群一个目录
   `<cwd>/.agent-group/groups/<群主会话id>/{roster.json,chat.log}`，
   同一个工作区里开多个聊天群会话互不干扰；旧布局（整工作区单群）继续兼容
-  - 首次把某个会话变成群：面板里点「**初始化为群聊**」，或直接用群聊 preset 的 `group_invite`
+  - 首次把某个会话变成群**无需任何额外操作**：用「多 Agent 聊天群」预设新建会话、发送第一条消息，
+    群预设会在会话首次步进时自动写入空名册（`groups/<会话id>/roster.json`），
+    面板随即把它识别为聊天群，直接点「拉入本会话」即可（也可调用 `POST /init` 显式创建）
 - 拉人可选 **「以完整能力运行」**：拉起后对子代理执行 `agentPresets.recompose` 换装为该 preset，**获得其真实工具集**（不只是人格）。已用行为实验验证：一个没有 `read` 工具的子代理，recompose 成 `standard` 后成功用 `read` 读取文件。聊天群成员自动忽略此选项（保持群工具）
 
 ### 2. 成员状态与移出
@@ -91,6 +93,7 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 | POST | `/api/dsh-agent-panel/pull` | `{sessionId, cwd?, ownerId?, presetId, name?, fullCapability?}` |
 | POST | `/api/dsh-agent-panel/retire` | `{sessionId, cwd?, memberId}` |
 | POST | `/api/dsh-agent-panel/restore` | `{sessionId, memberId}` |
+| POST | `/api/dsh-agent-panel/init` | `{sessionId, cwd?, name?}` — 显式创建群目录与空名册（正常流程由群预设自动完成） |
 
 ---
 
@@ -104,6 +107,8 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 - **工具黑名单降级**：`tools.restrict()` 按**父会话工具域**校验 deny 名字，报错信息里会列出真实域名；解析它做精确裁剪，避免整次拉人失败
 - **写策略显式化**：`fs.writeText` 默认策略会拒绝点路径（`.agent-group`）；显式传 `{mode:'workspace-write', workspaceRoot}` 后干净通过（不滥用 danger-full-access）
 - **完整能力模式**：拉起后对子代理作用域执行 `agentPresets.recompose(childCtx, presetId)`（DSH 官方的「会话换 preset」机制），子代理即拥有该 preset 的真实工具面。聊天群成员豁免（recompose 会剥掉群工具）
+- **多群目录解析**（`resolveGroupDir`）：新布局 `groups/<ownerSessionId>/` 优先；旧布局仅当名册 owner 匹配时沿用；名册读取失败一律按「不存在」处理，绝不因此让拉人失败
+- **群目录自动就绪**：群预设（`agent-chat-group/group.mjs`）在会话首次步进的 `agent/pre-step`（waterfall，监听器必须 `return next()`）里后台写入空名册——群目录的存在本身就是「这是群」的标记，前端无需检测或初始化。面板在 `pull` 时对「名册尚未出现」做 5×300ms 的窄竞态重试
 
 **浏览器半边**（`lib/client.js`）
 
