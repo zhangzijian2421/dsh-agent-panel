@@ -17,9 +17,13 @@
   - 成员名自动去重（重名 `-2` / `-3`）
   - `maxDepth=1`（成员不能再往下拉人）
   - 工具黑名单按目标会话的工具域**自动降级**，不会因为名字不认识而失败
-- **聊天群会话**（存在 `.agent-group/roster.json` 且名册归属该会话）额外同步：
-  - 写 `roster.json`、追加 `chat.log` 系统消息（与群聊 preset 的 `group_invite` 完全兼容，两条路径可混用）
+- **聊天群会话**（`.agent-group/groups/<会话id>/roster.json` 存在，或旧布局名册归属该会话）额外同步：
+  - 写名册、追加 `chat.log` 系统消息（与群聊 preset 的 `group_invite` 完全兼容，两条路径可混用）
   - 普通会话则不落任何文件，纯拉一个常驻子 agent
+- **一个工作区支持多个互相独立的群聊**：每个群一个目录
+  `<cwd>/.agent-group/groups/<群主会话id>/{roster.json,chat.log}`，
+  同一个工作区里开多个聊天群会话互不干扰；旧布局（整工作区单群）继续兼容
+  - 首次把某个会话变成群：面板里点「**初始化为群聊**」，或直接用群聊 preset 的 `group_invite`
 - 拉人可选 **「以完整能力运行」**：拉起后对子代理执行 `agentPresets.recompose` 换装为该 preset，**获得其真实工具集**（不只是人格）。已用行为实验验证：一个没有 `read` 工具的子代理，recompose 成 `standard` 后成功用 `read` 读取文件。聊天群成员自动忽略此选项（保持群工具）
 
 ### 2. 成员状态与移出
