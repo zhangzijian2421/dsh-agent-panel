@@ -108,7 +108,7 @@ await check('state 路由：服务全缺席也返回空群列表而不是崩', a
 	const response = await invoke(route, 'GET', '/api/dsh-agent-panel/state')
 	assert.equal(response.status, 200)
 	assert.deepEqual(response.json.groups, [])
-	assert.equal(response.json.default_group_preset, 'standard')
+	assert.equal(response.json.default_group_preset, 'group-host')
 	assert.deepEqual(response.json.caps, {
 		sessions: false, agents: false, subagents: false, agentPresets: false, sessionController: false
 	})

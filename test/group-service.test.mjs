@@ -3,15 +3,16 @@
  *
  * 钉住的语义：
  *   - 建群必须给 `session_id`：群 = 那个空会话本身（它本来就在工作区下面，无需归属操作）；
- *   - 先按会话自己的 preset 启动（adopt/resume，不与记录冲突），再用原生
- *     `agentPresets.select` 换成用户选的 preset——只有空白会话能换（非空白会抛 locked，
- *     此时保留原 preset 并在结果里如实说明）；
+ *   - **群主 preset 固定**（「群聊 Agent」= group-host，决定整群成员的能力上限）：
+ *     先按会话自己的 preset 启动（adopt/resume，不与记录冲突），再用原生 `agentPresets.select`
+ *     换成它——只有空白会话能换（非空白会抛 locked，此时保留原 preset 并在结果里如实说明）；
+ *     调用方传进来的 `preset_id` 一律忽略；
  *   - 标题加 👥 前缀，在侧边栏里区别于普通会话；
  *   - 拉人 = 群主会话下的具名常驻子代理（persona 来自被拉 preset，黑名单 + maxDepth=1）；
  *   - `state()` 报告群、成员（含"群主拉的"未注册成员）与能力面告警；
  *   - 解散 = 释放成员 + 归档会话 + 清注册表。
  */
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -43,6 +44,7 @@ async function check(label, fn) {
 }
 
 const PRESETS = [
+	{ id: 'group-host', name: '群聊 Agent', description: '群聊主控：盘点成员能力边界并派活', trust: 'user' },
 	{ id: 'standard', name: '标准模式', description: '完整编码 agent', trust: 'system' },
 	{ id: 'minimal', name: '极简模式', description: '只有 shell', trust: 'system' },
 	{ id: 'se', name: 'SE 需求分析', description: '只做需求分析', trust: 'user' }
@@ -145,7 +147,8 @@ function makeHost(options) {
 			}
 			if (name === 'agentPresets') {
 				return {
-					async list() { return PRESETS },
+					// fixedPresetMissing：模拟"群聊 preset 没装"——建群必须当场失败并说清怎么装。
+					async list() { return options && options.fixedPresetMissing === true ? PRESETS.filter((row) => row.id !== 'group-host') : PRESETS },
 					async read(id) { return id === 'se' ? SE_DOC : '' },
 					async mount(agentCtx, id) { state.presetByAgent.set(String(agentCtx.agentId), String(id)); return { id } },
 					composedPreset(agentCtx) { return state.presetByAgent.get(String(agentCtx.agentId)) || null },
@@ -259,46 +262,51 @@ await check('makeSignal 满足 startContinuable 的鸭子类型要求', () => {
 })
 
 console.log('group: 建群（空会话 → 群聊）')
-await check('建群：启动空会话 + 原生 select 换 preset + 👥 标题 + 注册表', async () => {
+await check('建群：启动空会话 + 原生 select 换成固定的群主 preset + 👥 标题 + 注册表', async () => {
 	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
 	try {
 		const host = makeHost()
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		// 用户先建一个空会话（GUI 默认 minimal），再点「创建群聊」并选 standard。
+		// 用户先建一个空会话（GUI 默认 minimal），再点「创建群聊」——群主 preset 由宿主固定。
 		host.state.sessions.set('session-blank', { id: 'session-blank', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
-		const created = await service.createGroup({ session_id: 'session-blank', preset_id: 'standard' })
+		// 顺手证明"调用方传进来的 preset_id 会被忽略"。
+		const created = await service.createGroup({ session_id: 'session-blank', preset_id: 'minimal' })
 		assert.equal(created.ok, true, created.error)
 		assert.equal(created.id, 'session-blank', '群 = 这个空会话本身')
 		assert.equal(created.name, '群聊 · 1')
 		assert.equal(created.title, '👥 群聊 · 1', '侧边栏标题带 👥 前缀')
-		assert.equal(created.preset_id, 'standard')
+		assert.equal(created.preset_id, 'group-host', '群主 preset 固定为群聊 Agent，忽略调用方传的值')
 		assert.equal(created.preset_error, undefined)
 		assert.deepEqual(host.state.ensureCalls, [{ id: 'session-blank', cwd: 'D:\\work', check: true, preset: 'minimal' }], '先按会话自己的 preset 启动')
-		assert.deepEqual(host.state.selects, [{ agent: 'session-blank', preset: 'standard' }], '再用空白特权换成所选 preset')
+		assert.deepEqual(host.state.selects, [{ agent: 'session-blank', preset: 'group-host' }], '再用空白特权换成固定的群主 preset')
 		assert.deepEqual(host.state.titles, [{ id: 'session-blank', title: '👥 群聊 · 1' }])
 		const registry = JSON.parse(readFileSync(join(dir, 'groups.json'), 'utf8'))
-		assert.equal(registry.groups['session-blank'].presetId, 'standard')
+		assert.equal(registry.groups['session-blank'].presetId, 'group-host')
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
-await check('建群失败路径：缺 session_id / 会话不存在 / 会话无 cwd / preset 不存在', async () => {
+await check('建群失败路径：缺 session_id / 会话不存在 / 会话无 cwd / 群聊 preset 未安装', async () => {
 	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
 	try {
 		const host = makeHost()
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const noSession = await service.createGroup({ preset_id: 'standard' })
+		const noSession = await service.createGroup({})
 		assert.equal(noSession.ok, false)
 		assert.match(noSession.error, /需要 session_id/)
-		const ghost = await service.createGroup({ session_id: 'session-nope', preset_id: 'standard' })
+		const ghost = await service.createGroup({ session_id: 'session-nope' })
 		assert.equal(ghost.ok, false)
 		assert.match(ghost.error, /会话不存在/)
 		host.state.sessions.set('session-nocwd', { id: 'session-nocwd', header: {} })
-		const noCwd = await service.createGroup({ session_id: 'session-nocwd', preset_id: 'standard' })
+		const noCwd = await service.createGroup({ session_id: 'session-nocwd' })
 		assert.equal(noCwd.ok, false)
 		assert.match(noCwd.error, /没有工作目录/)
-		host.state.sessions.set('session-p', { id: 'session-p', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
-		const badPreset = await service.createGroup({ session_id: 'session-p', preset_id: 'ghost' })
-		assert.equal(badPreset.ok, false)
-		assert.match(badPreset.error, /preset 不存在/)
+		// 群聊 preset 是我们硬依赖的：目录不在就该当场失败并说清怎么装。
+		const bare = makeHost({ fixedPresetMissing: true })
+		bare.state.sessions.set('session-p', { id: 'session-p', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const bareService = createGroupService(bare.ctx, { registryFile: join(dir, 'bare.json') })
+		const missing = await bareService.createGroup({ session_id: 'session-p' })
+		assert.equal(missing.ok, false)
+		assert.match(missing.error, /group-host/)
+		assert.match(missing.error, /\.agent-presets/)
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('非空白会话：select 被拒时保留原 preset 并如实说明', async () => {
@@ -307,7 +315,7 @@ await check('非空白会话：select 被拒时保留原 preset 并如实说明'
 		const host = makeHost({ selectFails: 'agent-preset/locked: the session has already started' })
 		host.state.sessions.set('session-started', { id: 'session-started', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const created = await service.createGroup({ session_id: 'session-started', preset_id: 'standard' })
+		const created = await service.createGroup({ session_id: 'session-started' })
 		assert.equal(created.ok, true, created.error)
 		assert.equal(created.preset_id, 'minimal', '保留会话原有 preset')
 		assert.match(created.preset_error, /locked/)
@@ -330,11 +338,11 @@ await check('会话已经在线时不再开第二个写句柄（active write han
 		host.state.sessions.set('session-live', { id: 'session-live', header: { cwd: 'D:\\work', agentPreset: 'standard' } })
 		host.state.presetByAgent.set('session-live', 'standard')
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const created = await service.createGroup({ session_id: 'session-live', preset_id: 'standard', name: '在线建群' })
+		const created = await service.createGroup({ session_id: 'session-live', name: '在线建群' })
 		assert.equal(created.ok, true, created.error)
 		assert.equal(host.state.resumes.length, 0, '在线会话不能 resume（会撞 already owned by an active write handle）')
 		assert.equal(host.state.ensureCalls.length, 0, '在线会话也不该再走 ensureSession')
-		assert.equal(created.preset_id, 'standard')
+		assert.equal(created.preset_id, 'group-host', '在线的会话也会被切成固定的群主 preset')
 		assert.equal(created.owner_model, 'deepseek-official/deepseek-flash')
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
@@ -344,10 +352,10 @@ await check('重复创建同一个群：保留既有成员与创建时间', asyn
 		const host = makeHost()
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const first = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		const first = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', name: '验证群' })
 		const pulled = await service.pull({ group_id: first.id, preset_id: 'se' })
 		assert.equal(pulled.ok, true, pulled.error)
-		const again = await service.createGroup({ session_id: 'session-g', preset_id: 'standard' })
+		const again = await service.createGroup({ session_id: 'session-g' })
 		assert.equal(again.ok, true, again.error)
 		assert.equal(again.name, '验证群', '再次创建不该改名')
 		const registry = JSON.parse(readFileSync(join(dir, 'groups.json'), 'utf8'))
@@ -363,7 +371,7 @@ async function setupGroup() {
 	const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
 	// 空会话是 GUI 建的（默认 minimal）；建群把它变成群聊。
 	host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
-	const created = await service.createGroup({ session_id: 'session-g', preset_id: 'standard', name: '验证群' })
+	const created = await service.createGroup({ session_id: 'session-g', name: '验证群' })
 	if (created.ok !== true) throw new Error('setup 失败: ' + created.error)
 	return { dir, host, service, groupId: created.id, created }
 }
@@ -388,7 +396,7 @@ await check('拉人：label/persona/黑名单/maxDepth 与注册表都正确', a
 		assert.ok(spec.signal && typeof spec.signal.throwIfAborted === 'function')
 		const registry = JSON.parse(readFileSync(join(dir2, 'groups.json'), 'utf8'))
 		assert.equal(registry.groups[groupId].members[0].presetId, 'se')
-		assert.match(pulled.capability, /群主 preset（standard）/)
+		assert.match(pulled.capability, /群主 preset（group-host）/)
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('同名成员自动退避 -2；显式重名直接拒绝', async () => {
@@ -410,19 +418,24 @@ await check('降级：工具域不认全部黑名单时按解析结果裁剪并�
 		const host = makeHost({ startFails: 'tools.restrict() names unknown global tools: pwsh, list_agents, interrupt_agent, ask_user_question' })
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const group = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard' })
+		const group = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work' })
 		const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
 		assert.equal(pulled.ok, true, JSON.stringify(pulled))
 		assert.deepEqual(host.state.specs[0].request.toolFilter.deny, ['list_agents', 'interrupt_agent', 'ask_user_question'])
 		assert.match(pulled.warning, /黑名单已裁剪/)
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
-await check('拉人失败路径：群不存在 / preset 不存在 / 群主起不来', async () => {
+await check('拉人失败路径：群不存在 / preset 不存在 / 群聊 preset 不能当成员 / 群主起不来', async () => {
 	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
 	try {
 		const { dir: setupDir, host, service, groupId } = await setupGroup()
 		assert.equal((await service.pull({ group_id: 'group-nope', preset_id: 'se' })).ok, false)
 		assert.equal((await service.pull({ group_id: groupId, preset_id: 'ghost' })).ok, false)
+		// 群聊 preset 是"群主"：它的人格是"我不亲自干活"，拉成成员只会得到一个不肯动手的人。
+		const owner = await service.pull({ group_id: groupId, preset_id: 'group-host' })
+		assert.equal(owner.ok, false)
+		assert.match(owner.error, /群主专用/)
+		assert.equal(host.state.specs.length, 0, '拒绝的拉人不该真的开工')
 		host.state.agents.clear()
 		const noController = { get: (name) => (name === 'agents' ? { get: () => undefined } : host.ctx.get(name)) }
 		const offline = createGroupService(noController, { registryFile: join(setupDir, 'groups.json') })
@@ -439,7 +452,7 @@ await check('状态：注册成员 + 原生外来成员 + minimal 告警', async
 		const host = makeHost()
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
-		const group = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		const group = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', name: '验证群' })
 		await service.pull({ group_id: group.id, preset_id: 'se' })
 		host.state.children.set(group.id, [
 			{ kind: 'child', id: 'child-1', label: 'SE 需求分析', activity: 'running', mode: 'continuable' },
@@ -452,10 +465,16 @@ await check('状态：注册成员 + 原生外来成员 + minimal 告警', async
 		assert.equal(row.members[0].registered, true)
 		assert.equal(row.members[1].registered, false)
 		assert.equal(row.capability_warning, undefined)
-		host.state.sessions.set('session-weak', { id: 'session-weak', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
-		const weak = await service.createGroup({ session_id: 'session-weak', cwd: 'D:\\work', preset_id: 'minimal', name: '弱群' })
-		const weakRow = (await service.state()).groups.find((item) => item.id === weak.id)
-		assert.match(weakRow.capability_warning, /minimal/)
+		// 新建群已固定 group-host，minimal 群主只可能是历史遗留（老版本建的群）：
+		// 直接写注册表模拟，确认面板仍会对它报警。
+		const registryPath = join(dir, 'groups.json')
+		const registry = JSON.parse(readFileSync(registryPath, 'utf8'))
+		registry.groups['session-legacy'] = {
+			id: 'session-legacy', name: '弱群', cwd: 'D:\\work', presetId: 'minimal', createdAt: Date.now(), members: []
+		}
+		writeFileSync(registryPath, JSON.stringify(registry))
+		const legacyRow = (await service.state()).groups.find((item) => item.id === 'session-legacy')
+		assert.match(legacyRow.capability_warning, /minimal/)
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -483,7 +502,7 @@ async function setupWithMember() {
 	const host = makeHost()
 	const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
 	host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
-	const created = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+	const created = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', name: '验证群' })
 	const pulled = await service.pull({ group_id: created.id, preset_id: 'se' })
 	return { dir, host, service, groupId: created.id, memberId: pulled.member_id }
 }
@@ -505,7 +524,7 @@ await check('在线群会话缺 👥 前缀时自愈，且不重复刷', async (
 		const host = makeHost()
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', name: '验证群' })
 		assert.ok(host.state.titles.some((row) => row.title === '👥 验证群'), '建群即写 👥 标题: ' + JSON.stringify(host.state.titles))
 		// 模拟"老群"：当前标题里没有 👥 前缀（只清日志不够，要清真正的当前标题）
 		host.state.titles.length = 0
@@ -525,7 +544,7 @@ await check('pull 自愈标题：拉人时老群的标题也会补上', async ()
 		const host = makeHost()
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const created = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		const created = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', name: '验证群' })
 		host.state.titles.length = 0
 		host.state.titleBySession.clear()
 		const pulled = await service.pull({ group_id: created.id, preset_id: 'se' })
@@ -552,7 +571,7 @@ await check('解散：持有句柄时把群主 agent 也下线（否则归档删
 		const host = makeHost({ noController: true })
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const created = await service.createGroup({ session_id: 'session-g', preset_id: 'standard', name: '验证群' })
+		const created = await service.createGroup({ session_id: 'session-g', name: '验证群' })
 		assert.equal(created.ok, true, created.error)
 		assert.equal(host.state.resumes.length, 1, '兜底路径自己 resume（这条路径句柄归我们）')
 		const dissolved = await service.dissolve({ group_id: created.id })
@@ -568,7 +587,7 @@ await check('解散：句柄不在我们手里（GUI 拉的）时如实报告仍
 		const host = makeHost()
 		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
 		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
-		const created = await service.createGroup({ session_id: 'session-g', preset_id: 'standard', name: '验证群' })
+		const created = await service.createGroup({ session_id: 'session-g', name: '验证群' })
 		const dissolved = await service.dissolve({ group_id: created.id })
 		assert.equal(dissolved.owner_released, 'not-owned')
 		assert.equal(dissolved.owner_live, true)

@@ -30,6 +30,7 @@ async function check(label, fn) {
 }
 
 const PRESETS = [
+	{ id: 'group-host', name: '群聊 Agent', description: '群聊主控：盘点成员能力边界并派活', trust: 'user' },
 	{ id: 'standard', name: '标准模式', description: '完整编码 agent', trust: 'system' },
 	{ id: 'minimal', name: '极简模式', description: '只有 shell', trust: 'system' },
 	{ id: 'se', name: 'SE 需求分析', description: '只做需求分析', trust: 'user' }
@@ -178,21 +179,22 @@ let groupId = ''
 let memberId = ''
 
 console.log('e2e: 建群（空会话变成群聊）')
-await check('POST /group-create：把当前会话变成群聊 + 原生 select 换 preset + 👥 标题 + 注册表', async () => {
-	const created = await call(harness.routes, '/api/dsh-agent-panel/group-create', 'POST', { session_id: 'session-me', preset_id: 'standard' })
+await check('POST /group-create：把当前会话变成群聊 + 原生 select 换成固定的群主 preset + 👥 标题 + 注册表', async () => {
+	// 即使调用方传了 preset_id，群主 preset 也固定为 group-host。
+	const created = await call(harness.routes, '/api/dsh-agent-panel/group-create', 'POST', { session_id: 'session-me', preset_id: 'minimal' })
 	assert.equal(created.ok, true, created.error)
 	assert.equal(created.id, 'session-me', '群 = 这个空会话本身')
 	assert.equal(created.name, '群聊 · 1')
 	assert.equal(created.title, '👥 群聊 · 1', '侧边栏标题带 👥 前缀')
-	assert.equal(created.preset_id, 'standard')
-	assert.equal(created.preset_error, undefined, '空白会话能正常换成所选 preset')
+	assert.equal(created.preset_id, 'group-host')
+	assert.equal(created.preset_error, undefined, '空白会话能正常换成固定的群主 preset')
 	groupId = created.id
 	assert.deepEqual(harness.state.ensureCalls, [{ id: 'session-me', cwd: 'D:\\work', check: true, preset: 'minimal' }], '先按会话自己的 preset 启动')
-	assert.deepEqual(harness.state.selects, [{ agent: 'session-me', preset: 'standard' }], '再用空白特权换成所选 preset')
+	assert.deepEqual(harness.state.selects, [{ agent: 'session-me', preset: 'group-host' }], '再用空白特权换成固定的群主 preset')
 	assert.deepEqual(harness.state.titles, [{ id: 'session-me', title: '👥 群聊 · 1' }])
 	assert.equal(existsSync(registryFile), true, '注册表应落在临时 HOME 下')
 	const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
-	assert.equal(registry.groups['session-me'].presetId, 'standard')
+	assert.equal(registry.groups['session-me'].presetId, 'group-host')
 	assert.equal(registry.groups['session-me'].members.length, 0)
 })
 
@@ -208,7 +210,7 @@ await check('POST /pull：成员挂到群主会话下，persona/黑名单/maxDep
 	assert.equal(spec.request.maxDepth, 1)
 	assert.match(spec.request.persona, /只做需求分析/)
 	assert.ok(spec.request.toolFilter.deny.indexOf('group_pull') >= 0)
-	assert.match(pulled.capability, /群主 preset（standard）/)
+	assert.match(pulled.capability, /群主 preset（group-host）/)
 	const registry = JSON.parse(readFileSync(registryFile, 'utf8'))
 	assert.equal(registry.groups[groupId].members[0].presetId, 'se')
 	assert.equal(registry.groups[groupId].members[0].childId, memberId)
@@ -221,7 +223,7 @@ await check('POST /pull：未指定名称时自动去重', async () => {
 console.log('e2e: 状态与 @ 菜单')
 await check('GET /state：群、成员状态、preset 列表、默认群主 preset 都在', async () => {
 	const snapshot = await call(harness.routes, '/api/dsh-agent-panel/state', 'GET')
-	assert.equal(snapshot.default_group_preset, 'standard')
+	assert.equal(snapshot.default_group_preset, 'group-host')
 	assert.equal(snapshot.groups.length, 1)
 	const row = snapshot.groups[0]
 	assert.equal(row.id, groupId)
@@ -229,8 +231,8 @@ await check('GET /state：群、成员状态、preset 列表、默认群主 pres
 	assert.equal(row.members.length, 2)
 	assert.equal(row.members[0].status, 'running', '原生子代理行被判为 running')
 	assert.equal(row.members[0].registered, true)
-	assert.equal(row.preset_id, 'standard')
-	assert.equal(snapshot.presets.length, 3)
+	assert.equal(row.preset_id, 'group-host')
+	assert.equal(snapshot.presets.length, 4)
 })
 await check('GET /members?sessionId=：@ 菜单源拿到本会话成员', async () => {
 	const payload = await call(harness.routes, '/api/dsh-agent-panel/members', 'GET', undefined, 'sessionId=' + groupId)

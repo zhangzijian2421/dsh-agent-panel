@@ -131,8 +131,8 @@ console.log("dock seat — blank session (the reported bug)");
 	check("still renders the 群聊 pill", pill !== undefined);
 	const create = flat.find((el) => el.type === "button" && String(el.children[0]).indexOf("创建群聊") >= 0);
 	check("blank 会话出现「＋ 创建群聊」按钮", create !== undefined);
-	const select = flat.find((el) => el.type === "select");
-	check("带群主 preset 选择器", select !== undefined);
+	// 群主 preset 固定为「群聊 Agent」：不再有选择器（换成固定值由宿主决定）。
+	check("没有群主 preset 选择器", !flat.some((el) => el.type === "select"));
 }
 
 console.log("dock seat — started session");
@@ -160,8 +160,8 @@ console.log("dock seat — 创建群聊流程（空会话点按钮 → POST /gro
 		try { body = options && options.body ? JSON.parse(options.body) : undefined; } catch (error) { body = undefined; }
 		calls.push({ path, method, body });
 		const payload = path.indexOf("/group-create") >= 0
-			? { ok: true, id: "session-blank-1", name: "群聊 · 1", preset_id: "standard", title: "👥 群聊 · 1" }
-			: { default_group_preset: "standard", presets: [{ id: "standard", name: "标准模式" }], groups: [] };
+			? { ok: true, id: "session-blank-1", name: "群聊 · 1", preset_id: "group-host", title: "👥 群聊 · 1" }
+			: { default_group_preset: "group-host", presets: [{ id: "group-host", name: "群聊 Agent" }, { id: "se", name: "SE 需求分析" }], groups: [] };
 		return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(payload) });
 	};
 	const seats2 = loadBundle(fetchImpl);
@@ -175,12 +175,23 @@ console.log("dock seat — 创建群聊流程（空会话点按钮 → POST /gro
 	})(dock);
 	const create = flat.find((el) => el.type === "button" && String(el.children[0]).indexOf("创建群聊") >= 0);
 	check("创建群聊按钮存在（空白会话 dock 行）", create !== undefined);
-	check("preset 选择器存在", flat.some((el) => el.type === "select"));
+	// 群主 preset 固定：不再有选择器，只在旁边写明固定值。
+	check("不再提供群主 preset 选择器", !flat.some((el) => el.type === "select"));
 	const overlaySeat = seats2.get("shell.overlay");
 	create.props.onClick();
 	await new Promise((resolve) => setImmediate(resolve));
 	const call = calls.find((c) => c.path.indexOf("/group-create") >= 0);
-	check("POST /group-create 带 session_id 与 preset_id", call !== undefined && call.method === "POST" && call.body.session_id === "session-blank" && call.body.preset_id === "standard");
+	check("POST /group-create 只带 session_id（preset 由宿主固定）", call !== undefined && call.method === "POST" && call.body.session_id === "session-blank" && call.body.preset_id === undefined);
+	// 状态落地后重渲染：dock 行会写明固定群主是谁。
+	const rerendered = seats2.get("conversation.input.dock")(blankProps);
+	const flat2 = [];
+	(function w2(x) {
+		if (x === null || x === undefined || typeof x !== "object") return;
+		if (Array.isArray(x)) { x.forEach(w2); return; }
+		flat2.push(x);
+		(x.children || []).forEach(w2);
+	})(rerendered);
+	check("写明固定群主（群聊 Agent）", flat2.some((el) => typeof el.children[0] === "string" && el.children[0].indexOf("群聊 Agent") >= 0));
 	const overlay = overlaySeat(overlaySeatBlankProps());
 	check("建群后面板自动打开（可继续拉人）", overlay !== null);
 }

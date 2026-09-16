@@ -14,8 +14,9 @@ const check = suite.check;
 
 const CANNED = {
 	"/api/dsh-agent-panel/state": {
-		default_group_preset: "standard",
+		default_group_preset: "group-host",
 		presets: [
+			{ id: "group-host", name: "群聊 Agent", description: "群聊主控：盘点成员能力边界并派活", trust: "user" },
 			{ id: "standard", name: "标准模式", description: "完整编码 agent", trust: "system" },
 			{ id: "se", name: "SE 需求分析", description: "只做需求分析", trust: "user" }
 		],
@@ -77,6 +78,13 @@ await check("拿到状态后渲染群聊、成员、已移除、preset 与能力
 });
 
 console.log("client panel: 交互")
+await check("拉人列表排除群主 preset（它是群主，不能当成员）", () => {
+	const panel0 = first.render(first.seats.get("shell.overlay"), {});
+	const text = texts(panel0);
+	assert.equal(findButtons(panel0, "拉入本群").length, 2, "只该列出 standard 与 se 两个成员 preset");
+	const at = text.indexOf("拉进本群");
+	assertThat(text.slice(at).includes("群聊 Agent") === false, "群主 preset 不该出现在拉人列表：" + text.slice(at));
+});
 await check("拉人：POST /pull 带 group_id + preset_id", async () => {
 	first.calls.length = 0;
 	const button = findButton(panel, "拉入本群");
@@ -141,8 +149,8 @@ await check("宿主返回 ok:false 时把 error 渲染成错误行", async () =>
 	assertThat(texts(after).includes("已被占用"), "应显示宿主错误：" + texts(after));
 	delete CANNED["/api/dsh-agent-panel/pull"];
 });
-await check("没有群聊时提示先建群，并给出创建入口 + preset 选择", async () => {
-	CANNED["/api/dsh-agent-panel/state"] = { default_group_preset: "standard", presets: CANNED["/api/dsh-agent-panel/state"].presets, groups: [] };
+await check("没有群聊时提示先建群，并给出创建入口（群主 preset 固定，不可选）", async () => {
+	CANNED["/api/dsh-agent-panel/state"] = { default_group_preset: "group-host", presets: CANNED["/api/dsh-agent-panel/state"].presets, groups: [] };
 	const third = load();
 	const node = await openWithData(third);
 	const text = texts(node);
@@ -150,14 +158,14 @@ await check("没有群聊时提示先建群，并给出创建入口 + preset 选
 	assertThat(findButton(node, "创建群聊") !== undefined, "缺创建群聊按钮");
 	let select;
 	walk(node, (element) => { if (element.type === "select") select = element; });
-	assertThat(select !== undefined, "缺群主 preset 选择器");
-	assert.equal(select.props.value, "standard", "默认应选中 default_group_preset");
+	assertThat(select === undefined, "不该再有群主 preset 选择器");
+	assertThat(text.includes("群聊 Agent"), "应写明固定的群主 preset：" + text);
 	third.calls.length = 0;
 	findButton(node, "创建群聊").props.onClick();
 	await new Promise((resolve) => setImmediate(resolve));
 	const call = third.calls.find((row) => row.path.endsWith("/group-create"));
 	assertThat(call !== undefined, "没有发出 group-create 请求");
-	assert.deepEqual(call.body, { session_id: "session-me", preset_id: "standard" });
+	assert.deepEqual(call.body, { session_id: "session-me" });
 });
 await check("已移除成员不再出现在成员区（分区互斥）", () => {
 	const node = first.render(first.seats.get("shell.overlay"), {});

@@ -5,10 +5,14 @@
  * 用法：
  *   node tools/verify-group.mjs            完整走一遍（结束时会解散并归档验证群）
  *   node tools/verify-group.mjs --keep     保留验证群，方便在 GUI 里手看
- *   node tools/verify-group.mjs --cwd <dir>  指定验证群的工作目录（默认当前目录）
+ *   node tools/verify-group.mjs --cwd <dir>      指定验证群的工作目录（默认当前目录）
+ *   node tools/verify-group.mjs --preset <id>    拉哪个 preset 当成员（默认 se）
  *
  * 需要宿主已经重启到 v2：脚本先探测 `/state` 是否带 `default_group_preset`，
  * 否则直接告诉你"仍需重启 DSH"，不会去动任何东西。
+ *
+ * 群主 preset 由宿主固定为「群聊 Agent」（`default_group_preset`），**不可指定**；
+ * 脚本会把实际值打出来，并断言它等于探测到的固定值。
  */
 
 import { pathToFileURL } from 'node:url';
@@ -66,14 +70,16 @@ async function main() {
 	line('现有群聊', (probe.payload.groups || []).length);
 
 	console.log('\n[1/5] 建群');
-	const created = await call('/group-create', 'POST', { cwd, preset_id: 'standard', name: '端到端验证群' });
+	// 群主 preset 固定（宿主自己决定），所以这里不传 preset_id。
+	const created = await call('/group-create', 'POST', { cwd, name: '端到端验证群' });
 	if (created.payload.ok !== true) {
 		console.log('× 建群失败: ' + JSON.stringify(created.payload));
 		process.exit(4);
 	}
 	line('群 id', created.payload.id);
 	line('群名', created.payload.name);
-	line('群主 preset', created.payload.preset_id);
+	line('群主 preset', created.payload.preset_id + (created.payload.preset_id === probe.payload.default_group_preset ? '（固定值 ✓）' : '（≠ 固定值 ' + probe.payload.default_group_preset + ' ✗）'));
+	if (created.payload.preset_id !== probe.payload.default_group_preset) process.exit(8);
 	line('启动路径', created.payload.started_via);
 	line('群主模型', created.payload.owner_model);
 

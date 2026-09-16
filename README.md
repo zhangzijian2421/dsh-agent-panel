@@ -16,12 +16,28 @@ dsh plugin --profile web add @zijians-bow-is-long/dsh-agent-panel
 # 或手动：把包放进 ~/.dsh/profiles/web/node_modules/，并加入 package.json 的 dsh.profile.bundles
 ```
 
+还要有**群主 preset**（本插件硬依赖，群聊固定用它）。仓库里带了副本 `presets/group-host/`：
+
+```bash
+mkdir -p "$HOME/.dsh/.agent-presets/group-host"
+cp presets/group-host/*.yml "$HOME/.dsh/.agent-presets/group-host/"
+```
+
+```text
+~/.dsh/.agent-presets/group-host/
+  ├── preset.yml          # name / description
+  └── agent.cordis.yml    # 「群聊 Agent」人格 + 工作面（成员能力上限）
+```
+
+装好后 `/state` 的 `default_group_preset` 就是 `group-host`；**没装它建群会当场失败并提示这条路径**。
+
 使用：
 
-1. **新建一个空会话**，点 composer 上方的「＋ 创建群聊」（旁边可选群主 preset）——这个空会话就**变成**群聊。
+1. **新建一个空会话**，点 composer 上方的「＋ 创建群聊」——这个空会话就**变成**群聊。
    也可以先点「👥 群聊」打开面板再在面板里建。
-2. 群主 preset 默认 `standard`，**它决定全群成员的能力上限**；建群会改会话标题为 `👥 <群名>`
-   （侧边栏里区别于普通会话）。群会话仍然像普通会话一样工作，只是多了成员。
+2. 群主 preset **固定为「群聊 Agent」**（`group-host`），面板不再提供选择。它负责**盘点成员能力边界并派活**，
+   同时决定全群成员的能力上限；建群会改会话标题为 `👥 <群名>`（侧边栏里区别于普通会话）。
+   群会话仍然像普通会话一样工作，只是多了成员。
 3. 在「拉进本群」列表里点任意 preset 的「拉入本群」：该 preset 的 persona 成为成员人格，
    成员挂到群主会话下（`maxDepth=1`），群内名字自动去重（重名退避 `-2` / `-3`）。
    拉人会先跑一轮**入群握手**（见「已知边界」），就位后再派活。
@@ -37,34 +53,68 @@ dsh plugin --profile web add @zijians-bow-is-long/dsh-agent-panel
 
 插件会把这条消息**原样转达**给该成员（走原生 `subagents.sendMessage`，与 `send_message` 工具同一条通道），
 成员在自己的会话里真的开工，完成后把结论发回群主。命令里必须有任务文本——只 `@` 不写事不会叫醒任何人。
-详见「已知边界」里为什么需要这一步。
+不写 `@` 也行：群主会自己判断该派给谁（它有人格里的派活纪律）。详见「已知边界」。
 
 ---
 
 ## 入口与位置（v2.2：空会话即群聊入口）
 
 - **新建一个空会话（＋ 新会话）**，空会话的 composer 上方会出现两个东西：
-  `👥 群聊`（打开拉人面板）和 **`＋ 创建群聊`**（旁边可选群主 preset）。
-- 点 **`＋ 创建群聊`**：这个空会话就变成群聊——群主 preset 切到所选值（原生空白会话切预设）、
-  标题改为 `👥 群聊 · N`（在侧边栏里区别于普通会话）、注册进群聊面板，然后面板自动打开让你拉人。
+  `👥 群聊`（打开拉人面板）和 **`＋ 创建群聊`**（旁边写着固定的群主 preset 名）。
+- 点 **`＋ 创建群聊`**：这个空会话就变成群聊——群主 preset 用原生空白会话切预设切到固定的
+  「群聊 Agent」、标题改为 `👥 群聊 · N`（在侧边栏里区别于普通会话）、注册进群聊面板，
+  然后面板自动打开让你拉人。
 - 群会话**本来就在工作区下面**（它就是一个普通会话），不需要任何"归属/挂载"操作；
   与普通会话的区别靠标题的 👥 前缀和面板里的群标记。
 - 拉人：面板 → 选 preset → 「拉入本群」；移出/恢复/改名/解散都在面板里。
-- 会话一旦开始就不能再改群主 preset（DSH 语义：空白会话才能切预设）。
+  「群聊 Agent」自己不会出现在拉人列表里（它是群主，不是成员）。
+- 会话一旦开始就不能再改群主 preset（DSH 语义：空白会话才能切预设）；
+  非空会话里点建群会保留原 preset 并在结果里如实说明 `preset_error`。
 
 ---## 架构
 
 ```
-group-<uuid>            ← 群主会话（root 会话，preset 建群时指定，默认 standard）
+<群主会话>              ← 就是一个普通会话：建群 = 把当前空会话变成群聊
    ├── 成员 A           ← 续存型子代理：label = 群内名字，persona = 被拉 preset 的 persona
    ├── 成员 B              toolFilter = 成员黑名单，maxDepth = 1
    └── …
-
-频道 = 群主会话自己的会话记录（成员 send_message → 父会话，原生 inbox 消息）
-名册/状态 = 原生子代理目录（subagents.listChildren：running / idle / inactive）
-唤醒/转达 = 群主 agent 自带的 send_message
+群体三件套：
+  群主 = 固定的「群聊 Agent」preset（group-host）：盘点成员能力边界 → 派活 → 汇总
+  频道 = 群主会话自己的会话记录（成员的回执原生落进父会话）
+  名册/状态 = 原生子代理目录（subagents.listChildren：running / idle / inactive）
 唯一自建状态 = ~/.dsh/dsh-agent-panel/groups.json（哪些会话是群、群名、群主 preset、成员当初用哪个 preset 拉的）
 ```
+
+## 群主 preset「群聊 Agent」（`group-host`）
+
+**它是群聊的大脑，也是全群成员的能力上限**：子 agent 通过 `agentPresets.composeFrom(childCtx, parent.ctx)`
+加入父会话的 preset，所以「成员工具面 = 群主 preset 的工具面 ∩ 成员黑名单」。因此它必须是一个
+工作面完整的 preset，而不是 `minimal` 那种只有 shell 的。
+
+它不在本仓库的运行路径里，而是一个普通的用户 preset（本插件硬依赖它，建群时固定使用、不可选择）。
+仓库里保留了它的源文件副本 `presets/group-host/`，安装时拷过去：
+
+```text
+${DSH_HOME:-~/.dsh}/.agent-presets/group-host/
+  ├── preset.yml          # name: 群聊 Agent
+  └── agent.cordis.yml    # persona + 工作面
+```
+
+```bash
+Copy-Item .\presets\group-host\*.yml "$env:USERPROFILE\.dsh\.agent-presets\group-host\" -Force
+```
+
+`agent.cordis.yml` 的 persona 写死了三条纪律（改这个文件就是改群主行为，改完**重启 DSH**）：
+
+1. **只做三件事**：盘点成员能力边界、把活派给最合适的成员、汇总成员回报。不亲自做实现
+   （成员的名字不足以判断能力——它被要求必要时直接 `send_message` 问成员"你能用哪些工具、不做什么"）。
+2. **任务必须自包含**：目标 / 输入 / 边界 / 验收标准 / 回报格式，一次派一个，不重复派给多人。
+3. **汇总用固定结构**：谁在做什么 / 结论（带依据）/ 风险 / 需要用户拍板的事。
+
+工作面从 shipped `standard` 复制后裁剪，保留了文件、检索、shell、skills、计划模式、压缩与
+**委派三件套**（`send_message` / `list_agents` / `interrupt_agent` + `subagent` / `subagent_fork`），
+去掉「实现迭代」导向的 `tool-ralph` / `tool-workflow` / 目标循环。改完用
+`dsh` 的 preset 挂载校验（`agentPresets.standingKeyFor('group-host')`）验一遍再重启。
 
 三段代码：
 
@@ -94,7 +144,7 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
 | GET | `/api/dsh-agent-panel/state` | 群聊列表 + 成员 + preset 列表 + 服务可用性 |
-| POST | `/api/dsh-agent-panel/group-create` | 建群：`{session_id?｜cwd?, preset_id?, name?}` |
+| POST | `/api/dsh-agent-panel/group-create` | 建群：`{session_id, cwd?, name?}`（群主 preset 固定，传 `preset_id` 会被忽略） |
 | POST | `/api/dsh-agent-panel/group-rename` | 改名：`{group_id, name}`（同时写会话标题） |
 | POST | `/api/dsh-agent-panel/group-dissolve` | 解散：`{group_id}` |
 | POST | `/api/dsh-agent-panel/pull` | 拉人：`{group_id, preset_id, name?}` |
@@ -102,7 +152,8 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 | POST | `/api/dsh-agent-panel/restore` | 恢复显示：`{group_id, member_id}` |
 | GET | `/api/dsh-agent-panel/members?sessionId=` | 某会话自己的常驻成员（`@` 菜单用） |
 
-模型工具：`group_pull`（不带 `preset_id` 时返回群状态）、`group_create`。两者都在成员黑名单里——只有群主与宿主能用。
+模型工具：`group_pull`（不带 `preset_id` 时返回群状态）、`group_create`（不接受 `preset_id`：群主 preset 固定）。
+两者都在成员黑名单里——只有群主与宿主能用。
 
 ---
 
@@ -130,7 +181,13 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
   本插件在 `lib/dispatch.js` 里包装 `sessionReferenceResolver.prepare`，**只对群会话**把"被 @ 的成员"
   变成真派活：`subagents.sendMessage(群主, 成员, 原消息)`，并给群主看到的消息追加一行「这条已转达，
   你不要重复做」。非群会话、非成员的引用、以及"只 @ 不写事"的消息都不动。
-  注意成员的能力面仍由**群主 preset** 决定：群主是 `minimal` 时，成员只有 shell。
+  注意成员的能力面仍由**群主 preset** 决定（现在是固定的 `group-host`，工作面完整；只有历史遗留的
+  `minimal` 群会被面板报警）。
+- **群主 preset 是固定的，不可选**：它是「群聊 Agent」(`group-host`)，负责盘点成员能力边界并派活，
+  同时是**全群成员的能力上限**。建群/`group_create` 传进来的 `preset_id` 一律被忽略；
+  它也不能被拉成成员（`pull` 会拒绝）。要改它的行为就改
+  `${DSH_HOME:-~/.dsh}/.agent-presets/group-host/agent.cordis.yml` 再重启 DSH——**它不是本仓库的一部分**，
+  本插件只是硬依赖它：没装时建群会当场失败并打印该路径。
 - **拉人必然先跑一轮"入群握手"**：`subagents.startContinuable` 要求带一条初始 prompt 且投递即开轮
   （`delivery: 'queue'`），DSH 没有"只建档不跑"的创建原语。所以这一轮被钉死成一次**明确无任务**的握手
   （`memberWelcome`：不调研、不读文件、不调工具，只回一行就位确认）。**别在这一轮派活**——实机教训：旧文案
@@ -157,8 +214,9 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
   成员只能向群主汇报，由群主转达。
 - **成员能力面 = 群主的 preset**：子 agent 通过 `agentPresets.composeFrom(childCtx, parent.ctx)` 加入父会话的
   preset。**"每个成员跑自己的 preset 工具面"在本版本不可实现**（四条路都实测封死，见
-  [`docs/group-above-session.md`](docs/group-above-session.md) §7）。所以群主请用 `standard` / `cordis`；
-  面板对 `minimal` 群主会显式告警（否则成员只有 `pwsh`）。角色差异用 persona + 成员黑名单表达。
+  [`docs/group-above-session.md`](docs/group-above-session.md) §7）。角色差异用 persona + 成员黑名单表达。
+  新建的群都用固定的 `group-host`（工作面完整，成员能拿到 read/glob/grep/pwsh/write/…）；
+  只有用老版本建的 `minimal` 群会被面板显式告警（否则成员只有 shell）——那种群建议解散重建。
 - **沙箱继承**：delegation 的沙箱取父会话的显式覆盖，审批固定 `never`——群主会话在 `workspace-write` 下时，
   成员也在 `workspace-write` 下，需要审批的操作会被自动拒绝。
 - **原生子代理没有删除原语**：「移出」= 释放（`drainContinuableChildren`）+ 名册软删除；DSH 的持久记录
@@ -234,6 +292,9 @@ node tools/verify-group.mjs [--keep] [--cwd <dir>] [--preset <id>]
 ## 实机验证记录（2026-09-17）
 
 在真实宿主上跑 `node tools/verify-group.mjs --keep` 与手工取会话日志确认：
+
+> 注：这次验证时的群主 preset 还叫 `standard`（当时可自选）。现在群主固定为 `group-host`
+> （「群聊 Agent」），工作面与 `standard` 同源、仍是完整平面，所以下面这些工具面结论不变。
 
 | 项目 | 结果 |
 | --- | --- |
