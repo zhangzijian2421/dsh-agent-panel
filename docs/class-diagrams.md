@@ -348,6 +348,52 @@ E --> G[面板「已移除」分区灰显，可点「恢复」撤墓碑]
 | `label` | agent 名（面板用它当成员名） |
 | `hasChildren` | 是否还有下层 |
 
+#### 6.4.1 SubagentDescriptor（子代理描述符）
+
+**作用**：子代理的「出生证明」。创建时由 `snapshotSubagentDescriptor(...)` 生成，
+以 `subagent/descriptor` 事件**追加进子会话日志**，随后被子代理目录与投影缓存读取——
+它是子代理的 **agent 名（label）、模式、人格、黑名单**的唯一持久来源。
+**一旦写入不可修改**（没有更新接口；会话日志是 append-only）——
+这正是「原生子代理条不能改名/删除」的机制根源，也是本插件用墓碑做「已移除」标记的原因。
+
+**两种形态**（`SubagentDescriptorData`）：
+
+*continuable（常驻——面板拉的都是这种）*
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `mode` | `'continuable'` | 常驻模式 |
+| `label` | string | **agent 名**（面板成员名、原生子代理条显示名的来源） |
+| `provider` | string | 提供方：`'spawn'` / `'fork'`（实测 spawn 时写入） |
+| `agentProvider?` | string | 子代理的模型提供方（继承或显式指定时记录） |
+| `agentModel?` | string | 模型 |
+| `agentReasoningEffort?` | string | 推理力度 |
+| `persona?` | string | 拉人时注入的人格文本 |
+| `toolFilter?` | `{allow?, deny?}` | 工具黑白名单 |
+
+*one-shot（一次性委派）*
+
+| 字段 | 说明 |
+|---|---|
+| `mode` | `'one-shot'` |
+| `label?` | 可选名字（没起名时目录条目回退用 id） |
+
+**相关类型**：
+
+| 类型 | 说明 |
+|---|---|
+| `SubagentCapabilities` | 提供方能力声明，5 个布尔位：`agentOptions` / `outputSchema` / `depthLimit` / `toolFilter` / `persona`。spawn 提供方全支持——所以面板能传 persona / toolFilter / maxDepth |
+| `SubagentStartRequest` → `ResolvedSubagentStartRequest` | 后者 = 前者 + `descriptor`，是提供方 `start(request)` 的实际入参 |
+| `SubagentResult` | `{output, structured?, diagnostic?, stopReason}`；`stopReason` ∈ completed / aborted / error / max-tokens / refusal |
+
+**与其它类的关系**：
+
+- **写入**：SubagentRuntime 在 `materializeTracked` 的 setup 里
+  `child.session.append("subagent/descriptor", descriptor)`（子会话日志首事件之一）
+- **读取**：`listChildren` / 原生子代理目录 / 投影缓存——label 与模式的分类
+  「唯一依据是 subagent 投影」，目录条目的 `label` 就是这里的 `label`
+- **不可变 ⇒**：本插件无法实现「给已移除成员改名」，只能用墓碑隐藏 + 「已移除」标记
+
 ### 6.5 ToolRegistry（`tools` 服务）与工具过滤
 
 | 方法 | 参数 → 说明 |
