@@ -11,6 +11,10 @@
 ### 1. 面板：把 agent 拉进会话
 
 - 会话右上角 `👥 群聊拉人` → 就地弹出面板
+- **空会话（还没发过第一条消息）同样有按钮**：DSH 原生的会话头部在空白态整块隐藏
+  （`ConversationSessionHeader` 只在 `!session.blank` 时渲染），挂在头部里的按钮那时**根本不存在**；
+  因此本插件在 composer 上方的 `conversation.input.dock` 补了一个**只在空白态显示**的同一按钮，
+  会话一旦开始就自动让位给右上角那个（不会重复出现）
 - 列出**全部在线会话**做目标（当前会话排第一并标「当前」，可切换）
 - 列出**已安装 preset**，点「拉入本会话」即拉起一个常驻子 agent：
   - 人格取自该 preset 的 `persona.prefix`（`|` / `>` 各种标量块都支持）
@@ -36,6 +40,8 @@
   `sessionController.ensureSession(sessionId, cwd, true, 该会话已选预设)` 把它启动起来
   （复用在线 agent / 恢复冷会话 / 按该会话的预设创建），再拉人；返回 `autoStarted: true`
   —— 未启动的会话在面板里不再显示为「无法拉人」，拉人按钮始终可用
+- **当前会话永远是可选目标**：即使它没有被列入状态（例如 `header.cwd` 为空），面板也会把它补进
+  目标列表；`pull` 在缺 `cwd` 时按会话自身解析工作目录，所以这个目标依然可用
 
 ### 2. 成员状态与移出
 
@@ -123,7 +129,8 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 **浏览器半边**（`lib/client.js`）
 
 - `__ModuleLoader__.load({id, factory})` 形态；`inject: ["slots", "inputTriggers"]`
-- 面板挂在 `conversation.session.header.utilities`（触发器）+ `shell.overlay`（下拉卡片）
+- 面板挂在 `conversation.session.header.utilities`（正式会话的触发器）+ `conversation.input.dock`（**空白会话**的触发器，`session.blank` 门控，非空白返回 `null`）+ `shell.overlay`（下拉卡片）
+  - 空白态判定优先用 dock 的 owner prop `session.blank`，取不到时退回标准 props 的 `useSession((s) => s.blank)`；两者都没有就保持隐藏，宁可少显示也不重复出现两个按钮
 - `@` 源注册在 `ctx.inputTriggers.registerSource`，`order: -10` 排在 Sessions/Files 之前
 - **`@` 源的 `candidates` 永不 reject**（控制器会丢弃 fetch 失败的源），且**不提供 `header`**（那是「钻取面包屑」钩子，返回非空数组以外的东西会破坏菜单渲染）
 
@@ -136,6 +143,7 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 ```bash
 node test/mention-codec.test.mjs    # mention 编码与 shipped codec 逐字节兼容（含 ] \ emoji 转义）
 node test/mention-filter.test.mjs   # @ 过滤语义：保留自己的树、丢弃他人的、失败降级、可回滚
+node test/blank-trigger.test.mjs    # 空白会话触发器：头部席位 + dock 席位、blank 门控、不重复渲染
 ```
 
 ---
@@ -143,7 +151,8 @@ node test/mention-filter.test.mjs   # @ 过滤语义：保留自己的树、丢�
 ## 已知边界
 
 - **原生子代理条不可删/改名**：DSH 的 `dsh-subagent` 没有删除原语，子代理是「可冷恢复」的持久化实体，原生 UI 的记录会永久保留（惰性、不运行）。本插件的「移出」= 释放 + 名册/墓碑清理，属于 DSH 语义内的上限
-- **无 cwd 的会话不列出**：中途创建、还没绑定工作目录的会话（`header.cwd` 为空）不会进入面板目标列表；正常从界面新建的会话都带 cwd
+- **无 cwd 的会话不进状态列表，但仍可被拉人**：`state` 会跳过 `header.cwd` 为空的会话，
+  不过只要你正看着那个会话，面板就会把它补成目标（`pull` 自己解析 cwd）
 - **群工具是全局注册**：`group_send` / `group_read` / `group_members` 对每个会话的工具面都可见（调用时按会话守卫，无群目录会报错）。群预设会话里 preset 的同名工具按作用域就近解析，两者语义一致（同一份 roster/chat.log）
 - 插件为进程级单例面板：状态里的会话枚举是全量的，会话很多时首次打开会有一次遍历
 - `cwd` 的路径分隔符按首次出现推断（Windows `\` / POSIX `/`），混用盘符的极端场景未覆盖
