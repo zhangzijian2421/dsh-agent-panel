@@ -1,0 +1,28 @@
+{
+  "name": "@local/dsh-agent-panel",
+  "description": "拉 Agent 面板：任意会话右上角把已安装 preset 拉成本会话常驻成员；聊天群会话同步 roster.json 与 chat.log",
+  "version": "1.0.0",
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.5-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  }
+}
