@@ -153,6 +153,23 @@ node tools/verify-group.mjs [--keep] [--cwd <dir>] [--preset <id>]
 
 ---
 
+## 实机验证记录（2026-09-17）
+
+在真实宿主上跑 `node tools/verify-group.mjs --keep` 与手工取会话日志确认：
+
+| 项目 | 结果 |
+| --- | --- |
+| 宿主形状 | `/state` 带 `default_group_preset`；caps 全 true |
+| 建群 | `group-<uuid>` 建出，群名写进会话标题（会话日志 `session/title`），`started_via=agents.create`、`owner_model=deepseek-official/deepseek-flash` |
+| 拉人 | 成员 `parentSession=群主`、`delegationDepth=1`、`agentPreset=standard`；黑名单五个名字**在 standard 工具域中都存在**，不触发降级 |
+| **成员工具面** | **32 个工具**：`read/write/edit/grep/glob/pwsh/send_message/skill/subagent/...` 全在，`group_pull/group_create/list_agents/interrupt_agent/ask_user_question` 全不在（对照 v1 那个只有 12 个工具、42 次调用里 40 次 pwsh 的残废成员） |
+| 成员真的在跑 | 成员 `request/header` + `assistant/message` + `tool/call`（`pwsh`/`glob`）齐备 |
+| 频道原生 | 群主会话记录里直接出现成员的原生通知与收尾消息（`agent/inbox/spliced` → `user/message`） |
+| 群主能力面 | 37 个工具 = standard 平面 + `group_pull`/`group_create`（成员被黑名单挡住，群主/宿主可用） |
+| 移出 / 解散 | `release` 释放子代理；`group-dissolve` `drained`+`archived=true`，注册表清零 |
+
+---
+
 ## 回滚
 
 v2 是一次不兼容重写（群聊从"会话的一个属性"变成"独立会话"）。要退回 v1：
