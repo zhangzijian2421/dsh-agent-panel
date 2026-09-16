@@ -1,72 +1,16 @@
 /**
- * 客户端面板逻辑测试：用桩 React + 桩 fetch 在 VM 里跑**真实的客户端包**，
+ * 会话头触发器 + 下拉面板的逻辑测试：用共享测试台在 VM 里跑**真实的客户端包**，
  * 断言面板与宿主之间的接线（RPC 路径、请求字段名、两步确认、错误渲染）。
  *
  * 为什么值得单独测：这些字段名（group_id / preset_id / session_id / member_id）一旦写错，
  * 面板只会静默失败，而实机验证要重启 DSH 才能做一次——这里能在毫秒级跑完每一次交互。
  */
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 import assert from "node:assert/strict";
-import vm from "node:vm";
+import { createSuite, findButton, findButtons, loadClient, openPanel, openWithData, texts, walk } from "./helpers/client-harness.mjs";
 
-const here = dirname(fileURLToPath(import.meta.url));
-const source = readFileSync(join(here, "..", "lib", "client.js"), "utf8");
-
-const results = [];
-function check(label, fn) {
-	return Promise.resolve()
-		.then(fn)
-		.then(() => { results.push({ label, ok: true }); console.log("  ok   " + label); })
-		.catch((error) => { results.push({ label, ok: false }); console.log("  FAIL " + label + " → " + String((error && error.message) || error)); });
-}
-function assertThat(condition, message) {
-	if (!condition) throw new Error(message === undefined ? "assertion failed" : message);
-}
-
-/** 极简 React：useState/useEffect 按组件函数持续保存槽位，重复 render 即可看到状态推进。 */
-function makeReact() {
-	const stateSlots = new Map();
-	const effectSlots = new Map();
-	let current = null;
-	let index = 0;
-	const React = {
-		createElement(type, props, ...children) {
-			return { type, props: props === null || props === undefined ? {} : props, children };
-		},
-		useState(initial) {
-			const key = current;
-			const at = index++;
-			const slots = stateSlots.get(key) || [];
-			if (!(at in slots)) slots[at] = typeof initial === "function" ? initial() : initial;
-			stateSlots.set(key, slots);
-			return [slots[at], (next) => { slots[at] = typeof next === "function" ? next(slots[at]) : next; }];
-		},
-		useEffect(callback, deps) {
-			const key = current;
-			const at = index++;
-			const slots = effectSlots.get(key) || [];
-			const previous = slots[at];
-			const changed = previous === undefined || deps === undefined || previous.deps === undefined
-				|| deps.some((value, position) => value !== previous.deps[position]);
-			if (!changed) return;
-			if (previous !== undefined && typeof previous.cleanup === "function") previous.cleanup();
-			slots[at] = { deps, cleanup: callback() };
-			effectSlots.set(key, slots);
-		},
-		useMemo(factory) { return factory(); },
-		useRef(value) { return { current: value }; }
-	};
-	return {
-		React,
-		render(component, props) {
-			current = component;
-			index = 0;
-			return component(props);
-		}
-	};
-}
+const assertThat = (value, message) => assert.ok(value, message);
+const suite = createSuite();
+const check = suite.check;
 
 const CANNED = {
 	"/api/dsh-agent-panel/state": {
@@ -93,111 +37,7 @@ const CANNED = {
 	}
 };
 
-/** 载入真实客户端包，返回座位表 + fetch 记录 + 渲染器 + 模块级 open 开关。 */
-function load() {
-	const calls = [];
-	const fetch = (path, options) => {
-		const method = options === undefined || options.method === undefined ? "GET" : options.method;
-		let body;
-		try { body = options && options.body === undefined ? undefined : JSON.parse(options.body); } catch (error) { body = options && options.body; }
-		calls.push({ path, method, body });
-		const payload = CANNED[path.split("?")[0]];
-		if (payload !== undefined && payload.__throw !== undefined) return Promise.reject(new Error(payload.__throw));
-		return Promise.resolve({
-			ok: true,
-			status: 200,
-			json: () => Promise.resolve(payload === undefined ? { ok: false, error: "no canned response for " + path } : payload)
-		});
-	};
-	const seats = new Map();
-	const sources = [];
-	let last = null;
-	const ctx = {
-		get: (name) => {
-			if (name === "sessions") return { open: () => {} };
-			if (name === "inputTriggers") return { registerSource: (source) => { sources.push(source); return () => {}; } };
-			return undefined;
-		},
-		effect(callback) { callback(); },
-		slots: {
-			inject(name, callback) { callback(); seats.set(name, last); return () => {}; },
-			register(_registration, component) { last = component; return () => {}; }
-		}
-	};
-	const sandbox = {
-		console,
-		TextEncoder,
-		btoa: (value) => Buffer.from(value, "binary").toString("base64"),
-		fetch,
-		document: { createElement: () => ({ remove() {} }), head: { appendChild() {} } },
-		window: { __ModuleLoader__: { load: (definition) => { sandbox.__definition = definition; } } }
-	};
-	vm.createContext(sandbox);
-	new vm.Script(source, { filename: "client.js" }).runInContext(sandbox);
-	const react = makeReact();
-	const moduleExports = sandbox.__definition.factory((id) => {
-		if (id === "react") return react.React;
-		throw new Error("unexpected require: " + id);
-	});
-	moduleExports.apply(ctx);
-	return { seats, calls, render: react.render, sources };
-}
-
-/** 深度遍历元素树；数组子节点必须展平（真实 React 渲染时也会展平）。 */
-function walk(node, visit) {
-	if (node === null || node === undefined) return;
-	if (Array.isArray(node)) {
-		for (const item of node) walk(item, visit);
-		return;
-	}
-	if (typeof node !== "object") return;
-	visit(node);
-	for (const child of node.children || []) walk(child, visit);
-}
-function texts(node) {
-	const out = [];
-	walk(node, (element) => {
-		for (const child of element.children || []) if (typeof child === "string") out.push(child);
-	});
-	return out.join(" | ");
-}
-function findButton(node, label) {
-	let hit;
-	walk(node, (element) => {
-		if (hit !== undefined) return;
-		if (element.type !== "button") return;
-		const text = (element.children || []).map((child) => (typeof child === "string" ? child : "")).join("");
-		if (text.indexOf(label) >= 0) hit = element;
-	});
-	return hit;
-}
-function findButtons(node, label) {
-	const out = [];
-	walk(node, (element) => {
-		if (element.type !== "button") return;
-		const text = (element.children || []).map((child) => (typeof child === "string" ? child : "")).join("");
-		if (text.indexOf(label) >= 0) out.push(element);
-	});
-	return out;
-}
-/** 面板打开：点一次触发器即可（模块级 open 开关）。 */
-function openPanel(seats, render) {
-	const trigger = render(seats.get("conversation.session.header.utilities"), { sessionId: "session-me" });
-	// 触发器返回的是 <TriggerButton/>，按钮本身要调用组件函数才拿得到。
-	const button = trigger.type();
-	button.props.onClick();
-}
-
-/**
- * 打开面板并等到状态就绪。顺序很重要：面板必须**先渲染一次**，`refresh` 的 effect 才会跑起来，
- * 之后等一个 microtask 让 fetch 落地，再渲染才看得到数据。
- */
-async function openWithData(instance) {
-	openPanel(instance.seats, instance.render);
-	instance.render(instance.seats.get("shell.overlay"), {});
-	await new Promise((resolve) => setImmediate(resolve));
-	return instance.render(instance.seats.get("shell.overlay"), {});
-}
+const load = () => loadClient({ canned: CANNED });
 
 console.log("client panel: 座位与开关")
 const first = load();
@@ -402,7 +242,4 @@ await check("onPick 对坏 value / 非 session 值返回 undefined", () => {
 	assert.equal(source0.onPick({ candidate: { value: JSON.stringify({ kind: "file" }) } }), undefined);
 });
 
-const failed = results.filter((row) => !row.ok);
-console.log("");
-console.log(failed.length === 0 ? "ALL PASS (" + results.length + ")" : failed.length + " FAILED of " + results.length);
-process.exit(failed.length === 0 ? 0 : 1);
+suite.finish();

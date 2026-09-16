@@ -29,6 +29,27 @@ dsh plugin --profile web add @zijians-bow-is-long/dsh-agent-panel
 
 ---
 
+## 入口与位置（v2.1）
+
+| 入口 | 位置 | 用途 |
+| --- | --- | --- |
+| `👥 群聊`（侧边栏全局面板行） | `sidebar.panellist` id=`agent-groups` → 主面板 `main` key=`agent-groups` | **建群**（选工作区目录 + 群主 preset）、**挂到侧边栏**、拉人/移出/恢复/改名/打开/解散 |
+| `👥 群聊`（会话右上角 / 空会话 composer 上方） | `conversation.session.header.utilities` + `conversation.input.dock` | 在会话里快速拉人（下拉开面板） |
+
+**群聊出现在"左侧工作区下面"的条件**：群会话必须挂进那个工作区——DSH 的工作区持有自己的
+`sessionIds`（`Workspace.sessionIds`），没挂进去的会话不会出现在那棵树里。建群时会自动挂：
+
+1. 按群的工作目录在 `useWorkspaces` 快照里找同名工作区 → `workspaces.insertSessionBefore(workspaceId, groupId)`；
+2. 目录还不是工作区时先 `workspaces.create({ path })` 再挂；
+3. 老群（或当初没挂上的）在群聊页面点一次「挂到侧边栏」即可。
+
+> 为什么入口不在"工作区加号正下方"：侧边栏的工作区/会话整块是 `sidebar.workspaces`（**single**，
+> `replaceRisk: shadows-shipped-ui`），它下面没有任何"工作区行/加号旁"的加成槽位——要放在那儿
+> 就得整块替换它（自己重写搜索、工作区树、会话列表与所有对话框）。所以入口放在侧边栏的全局
+> 面板行，而**群列表通过上面的挂载出现在工作区下面**（与会话并列）。
+
+---
+
 ## 架构
 
 ```
