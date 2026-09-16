@@ -61,6 +61,9 @@ function makeHost(options) {
     archived: [],
     specs: [],
     ensureCalls: [],
+    creates: [],
+    resumes: [],
+    mounts: [],
     drained: [],
     startFails: (options && options.startFails) || null
   }
@@ -68,7 +71,25 @@ function makeHost(options) {
   const ctx = {
     get(name) {
       if (name === 'agents') {
-        return { get: (id) => state.agents.get(id) }
+        return {
+          get: (id) => state.agents.get(id),
+          async create(options) {
+            state.creates.push({ sessionId: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset })
+            if (typeof options.setup === 'function') await options.setup({ label: 'agentCtx' })
+            const agent = { id: options.sessionId, cwd: options.meta.cwd, preset: options.meta.agentPreset }
+            state.agents.set(agent.id, agent)
+            state.sessions.set(agent.id, { id: agent.id })
+            return { agent }
+          },
+          async resume(options) {
+            state.resumes.push(options.resumeSessionId)
+            if (typeof options.setup === 'function') await options.setup({ label: 'agentCtx' })
+            const agent = { id: options.resumeSessionId, cwd: state.resumeCwd || 'D:\\work', preset: state.resumePreset || 'standard' }
+            state.agents.set(agent.id, agent)
+            state.sessions.set(agent.id, { id: agent.id })
+            return { agent }
+          }
+        }
       }
       if (name === 'subagents') {
         return {
@@ -90,13 +111,14 @@ function makeHost(options) {
       if (name === 'agentPresets') {
         return {
           async list() { return PRESETS },
-          async read(id) { return DOCS[id] || '' }
+          async read(id) { return DOCS[id] || '' },
+          async mount(agentCtx, id) { state.mounts.push(id); return { id } }
         }
       }
       if (name === 'sessions') {
         return { get: (id) => state.sessions.get(id) }
       }
-      if (name === 'sessionController') {
+      if (name === 'sessionController' && !(options && options.noController)) {
         return {
           async ensureSession(id, cwd, check, preset) {
             state.ensureCalls.push({ id, cwd, check, preset })
@@ -303,6 +325,36 @@ await check('状态：注册成员 + 原生外来成员 + minimal 告警', async
     const weak = await service.createGroup({ cwd: 'D:\\work', preset_id: 'minimal' })
     const weakRow = (await service.state()).groups.find((item) => item.id === weak.id)
     assert.match(weakRow.capability_warning, /minimal/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+console.log('group: fallback（sessionController 缺席时只靠 catalog 内原语）')
+await check('建群兜底：agents.create({meta:{cwd,agentPreset}}) + presets.mount', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost({ noController: true })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const created = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    assert.equal(created.ok, true, created.error)
+    assert.equal(host.state.ensureCalls.length, 0, '没有走 sessionController')
+    assert.deepEqual(host.state.creates, [{ sessionId: created.id, cwd: 'D:\\work', preset: 'standard' }])
+    assert.deepEqual(host.state.mounts, ['standard'], '必须把 preset 真的 mount 上')
+    assert.equal((await service.state()).groups[0].owner_live, true)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('拉人兜底：群主冷掉时用 agents.resume + presets.mount 唤醒', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+  try {
+    const host = makeHost({ noController: true })
+    const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+    const group = await service.createGroup({ cwd: 'D:\\work', preset_id: 'standard' })
+    host.state.agents.clear()
+    host.state.resumePreset = 'standard'
+    const pulled = await service.pull({ group_id: group.id, preset_id: 'se' })
+    assert.equal(pulled.ok, true, pulled.error)
+    assert.deepEqual(host.state.resumes, [group.id])
+    assert.deepEqual(host.state.mounts, ['standard', 'standard'], 'create 与 resume 各 mount 一次')
+    assert.equal((await service.state()).groups[0].owner_live, true)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 

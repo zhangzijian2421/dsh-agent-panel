@@ -48,10 +48,15 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 | 文件 | 职责 |
 | --- | --- |
 | `lib/store.js` | 注册表：纯函数 + 原子文件读写（坏文件降级成空注册表，永不抛） |
-| `lib/group.js` | 群聊服务：建群 / 拉人 / 移除 / 恢复 / 解散 / 状态；persona 提取、黑名单降级 |
-| `lib/index.js` | 插件外壳：8 条 loopback 路由 + 2 个模型工具 + `@` 菜单过滤 |
+| `lib/group.js` | 群聊服务：建群 / 拉人 / 移除 / 恢复 / 解散 / 状态；persona 提取、黑名单降级 || `lib/index.js` | 插件外壳：8 条 loopback 路由 + 2 个模型工具 + `@` 菜单过滤 |
 | `lib/mention.js` | `@` 候选过滤（隐藏"别的会话的子代理"），与群模型无关 |
 | `lib/client.js` | 浏览器半边：触发器（会话头部 + 空会话 dock）、面板 UI、`@` 源 |
+
+把群主会话启动起来有**两条路**：首选 GUI 自己的 `sessionController.ensureSession`
+（adopt 在线 / resume 冷会话 / create 新会话，并把 preset 写进会话头）；但 `sessionController`
+不在 cordis 的公开 catalog 里，所以缺席时自动兜底到 catalog 内的原语
+`agents.create` / `agents.resume` + `agentPresets.mount`——也就是 api-session-controller
+内部 `composeAgent()` 的同一条路。两条路都有单测覆盖。
 
 ---
 
