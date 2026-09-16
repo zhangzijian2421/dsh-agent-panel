@@ -289,6 +289,46 @@ await check('非空白会话：select 被拒时保留原 preset 并如实说明'
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
+await check('会话已经在线时不再开第二个写句柄（active write handle 冲突）', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		// 模拟"用户正开着这个会话"：agent 已在线
+		host.state.agents.set('session-live', {
+			id: 'session-live',
+			ctx: { agentId: 'session-live' },
+			options: { provider: 'deepseek-official', model: 'deepseek-flash' },
+			session: { header: { cwd: 'D:\\work', agentPreset: 'standard' } }
+		})
+		host.state.sessions.set('session-live', { id: 'session-live', header: { cwd: 'D:\\work', agentPreset: 'standard' } })
+		host.state.presetByAgent.set('session-live', 'standard')
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const created = await service.createGroup({ session_id: 'session-live', preset_id: 'standard', name: '在线建群' })
+		assert.equal(created.ok, true, created.error)
+		assert.equal(host.state.resumes.length, 0, '在线会话不能 resume（会撞 already owned by an active write handle）')
+		assert.equal(host.state.ensureCalls.length, 0, '在线会话也不该再走 ensureSession')
+		assert.equal(created.preset_id, 'standard')
+		assert.equal(created.owner_model, 'deepseek-official/deepseek-flash')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('重复创建同一个群：保留既有成员与创建时间', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const first = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		const pulled = await service.pull({ group_id: first.id, preset_id: 'se' })
+		assert.equal(pulled.ok, true, pulled.error)
+		const again = await service.createGroup({ session_id: 'session-g', preset_id: 'standard' })
+		assert.equal(again.ok, true, again.error)
+		assert.equal(again.name, '验证群', '再次创建不该改名')
+		const registry = JSON.parse(readFileSync(join(dir, 'groups.json'), 'utf8'))
+		assert.equal(registry.groups['session-g'].members.length, 1, '名册不能被清空')
+		assert.equal(registry.groups['session-g'].members[0].name, 'SE 需求分析')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 console.log('group: 拉人')
 async function setupGroup() {
 	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
