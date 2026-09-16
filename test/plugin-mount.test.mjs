@@ -6,6 +6,7 @@
  */
 import assert from 'node:assert/strict'
 import { apply, inject, installMentionFilter, name } from '../lib/index.js'
+import { MEMBER_TOOL_DENY } from '../lib/group.js'
 
 const results = []
 function check(label, fn) {
@@ -154,6 +155,21 @@ await check('坏 JSON 体不炸：当成空参数处理', async () => {
 	assert.equal(payload.ok, false)
 	assert.match(payload.error, /工作目录/)
 	assert.equal(tools.length, 2)
+})
+
+console.log('plugin shell: 成员黑名单与本包工具面一致')
+await check('黑名单里属于本包的 tool 名必须真的注册过（防 v1 残留名）', () => {
+	const { tools } = mount()
+	const registered = new Set(tools.map((tool) => tool.name))
+	// 只检查"看起来属于本包"的名字：其余（list_agents / interrupt_agent / ask_user_question）
+	// 由别的插件提供，本包无法在离线测试里断言它们存在。
+	const ours = MEMBER_TOOL_DENY.filter((toolName) => toolName.startsWith('group_') || toolName.startsWith('agrp_'))
+	assert.ok(ours.length > 0, '黑名单应至少包含本包自己的拉人/建群工具')
+	for (const toolName of ours) {
+		assert.ok(registered.has(toolName), '黑名单里的 ' + toolName + ' 并不存在——tools.restrict() 会因此拒绝整个名单')
+	}
+	assert.equal(MEMBER_TOOL_DENY.includes('agrp_pull'), false, 'v1 的 agrp_pull 已删除，不应留在黑名单里')
+	assert.equal(MEMBER_TOOL_DENY.includes('group_invite'), false, 'v1 的 group_invite 已删除，不应留在黑名单里')
 })
 
 console.log('plugin shell: mention filter hook')

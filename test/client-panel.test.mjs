@@ -101,6 +101,7 @@ function load() {
 		try { body = options && options.body === undefined ? undefined : JSON.parse(options.body); } catch (error) { body = options && options.body; }
 		calls.push({ path, method, body });
 		const payload = CANNED[path.split("?")[0]];
+		if (payload !== undefined && payload.__throw !== undefined) return Promise.reject(new Error(payload.__throw));
 		return Promise.resolve({
 			ok: true,
 			status: 200,
@@ -108,9 +109,14 @@ function load() {
 		});
 	};
 	const seats = new Map();
+	const sources = [];
 	let last = null;
 	const ctx = {
-		get: (name) => (name === "sessions" ? { open: () => {} } : undefined),
+		get: (name) => {
+			if (name === "sessions") return { open: () => {} };
+			if (name === "inputTriggers") return { registerSource: (source) => { sources.push(source); return () => {}; } };
+			return undefined;
+		},
 		effect(callback) { callback(); },
 		slots: {
 			inject(name, callback) { callback(); seats.set(name, last); return () => {}; },
@@ -133,7 +139,7 @@ function load() {
 		throw new Error("unexpected require: " + id);
 	});
 	moduleExports.apply(ctx);
-	return { seats, calls, render: react.render };
+	return { seats, calls, render: react.render, sources };
 }
 
 /** 深度遍历元素树；数组子节点必须展平（真实 React 渲染时也会展平）。 */
@@ -320,6 +326,78 @@ await check("已移除成员不再出现在成员区（分区互斥）", () => {
 	const memberSection = text.slice(membersAt, removedAt);
 	assertThat(memberSection.includes("SE 需求分析"), "active 区应有注册成员");
 	assertThat(!memberSection.includes("老成员"), "active 区不应包含已移除成员");
+});
+
+console.log("client panel: @ 菜单源")
+const at = load();
+const source0 = at.sources[0];
+await check("注册了 @ 源（trigger/name/order/无 header）", () => {
+	assertThat(at.sources.length === 1, "应只注册一个 @ 源，实际 " + at.sources.length);
+	assert.equal(source0.trigger, "@");
+	assert.equal(source0.name, "session-agents");
+	assert.equal(source0.order, -10);
+	assert.equal(source0.showGroupTitle, false);
+	assertThat(source0.header === undefined, "不能提供 header（那是面包屑钩子）");
+});
+await check("没有 sessionId 时返回空数组", async () => {
+	// 注意：这些数组来自 VM realm，原型与宿主不同，所以只比长度/内容，不用 deepEqual。
+	assert.equal((await source0.candidates(undefined, { query: "" })).length, 0);
+	assert.equal((await source0.candidates({}, { query: "" })).length, 0);
+});
+await check("候选：名字用 agent 名，value 里是规范会话引用", async () => {
+	CANNED["/api/dsh-agent-panel/members"] = {
+		ok: true,
+		sessionId: "session-me",
+		members: [
+			{ id: "child-1", name: "SE 需求分析", status: "running", mode: "continuable" },
+			{ id: "child-2", name: "开发", status: "idle", mode: "one-shot" }
+		]
+	};
+	const rows = await source0.candidates({ sessionId: "session-me" }, { query: "" });
+	assert.equal(at.calls[at.calls.length - 1].path, "/api/dsh-agent-panel/members?sessionId=session-me");
+	assert.equal(rows.length, 2);
+	assert.equal(rows[0].name, "SE 需求分析");
+	assert.equal(rows[0].section, "本会话子 agent");
+	assert.match(rows[0].description, /常驻成员 · 运行中/);
+	assert.match(rows[1].description, /一次性 · 待命/);
+	const value = JSON.parse(rows[0].value);
+	assert.equal(value.kind, "session");
+	assert.equal(value.label, "SE 需求分析");
+	// 与宿主 codec 逐字节一致：@[label](dsh-session:<base64url(JSON.stringify(id))>)
+	const expected = "@[SE 需求分析](dsh-session:" + Buffer.from(JSON.stringify("child-1"), "utf8").toString("base64")
+		.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") + ")";
+	assert.equal(value.mention, expected);
+});
+await check("候选：按名字/id 过滤查询串", async () => {
+	const hit = await source0.candidates({ sessionId: "session-me" }, { query: "开发" });
+	assert.equal([...hit].map((row) => row.name).join(","), "开发");
+	const byId = await source0.candidates({ sessionId: "session-me" }, { query: "child-1" });
+	assert.equal([...byId].map((row) => row.name).join(","), "SE 需求分析");
+	assert.equal((await source0.candidates({ sessionId: "session-me" }, { query: "zzz" })).length, 0);
+});
+await check("candidates 永不 reject：fetch 抛错时降级成空数组", async () => {
+	CANNED["/api/dsh-agent-panel/members"] = { __throw: "network down" };
+	const rows = await source0.candidates({ sessionId: "session-me" }, { query: "" });
+	assert.equal(rows.length, 0);
+	delete CANNED["/api/dsh-agent-panel/members"];
+});
+await check("onPick 产出 reference 插入（含剪贴板文本）", async () => {
+	CANNED["/api/dsh-agent-panel/members"] = {
+		ok: true,
+		sessionId: "session-me",
+		members: [{ id: "child-1", name: "SE 需求分析", status: "running", mode: "continuable" }]
+	};
+	const rows = await source0.candidates({ sessionId: "session-me" }, { query: "" });
+	const picked = source0.onPick({ candidate: rows[0] });
+	assert.equal(picked.insert.source, "reference");
+	assert.equal(picked.insert.label, "SE 需求分析");
+	assert.equal(picked.insert.appearance, "session");
+	assert.equal(picked.insert.ref, picked.insert.clipboardText);
+	assert.match(picked.insert.ref, /^@\[SE 需求分析\]\(dsh-session:/);
+});
+await check("onPick 对坏 value / 非 session 值返回 undefined", () => {
+	assert.equal(source0.onPick({ candidate: { value: "{ not json" } }), undefined);
+	assert.equal(source0.onPick({ candidate: { value: JSON.stringify({ kind: "file" }) } }), undefined);
 });
 
 const failed = results.filter((row) => !row.ok);

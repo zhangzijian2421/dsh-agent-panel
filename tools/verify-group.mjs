@@ -11,6 +11,8 @@
  * 否则直接告诉你"仍需重启 DSH"，不会去动任何东西。
  */
 
+import { pathToFileURL } from 'node:url';
+
 const BASE = 'http://127.0.0.1:3080/api/dsh-agent-panel';
 const args = process.argv.slice(2);
 const keep = args.includes('--keep');
@@ -18,6 +20,16 @@ const cwdFlag = args.indexOf('--cwd');
 const cwd = cwdFlag >= 0 && args[cwdFlag + 1] !== undefined ? args[cwdFlag + 1] : process.cwd();
 const presetFlag = args.indexOf('--preset');
 const presetId = presetFlag >= 0 && args[presetFlag + 1] !== undefined ? args[presetFlag + 1] : 'se';
+
+/**
+ * 宿主是否是 v2：v2 的 `/state` 一定带 `default_group_preset`，v1 没有。
+ * 单独导出是为了能单测——这个判定一旦写反，脚本会把"没重启"说成"已就绪"（或反之），
+ * 而它是实机验证的唯一入口。
+ */
+export function isV2State(payload) {
+	return payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+		&& payload.default_group_preset !== undefined;
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,7 +55,7 @@ async function main() {
 		console.log('× /state 返回 ' + probe.status + '：' + JSON.stringify(probe.payload));
 		process.exit(2);
 	}
-	if (probe.payload.default_group_preset === undefined) {
+	if (!isV2State(probe.payload)) {
 		console.log('× 宿主看起来仍是 v1（/state 没有 default_group_preset）→ 先重启 DSH 再跑本脚本。');
 		line('现有 groups', (probe.payload.groups || []).length);
 		process.exit(3);
@@ -114,7 +126,11 @@ async function main() {
 	console.log('\n全部断言通过（已清理）。');
 }
 
-main().catch((error) => {
-	console.log('× 异常: ' + String((error && error.message) || error));
-	process.exit(1);
-});
+const executedDirectly = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (executedDirectly) {
+	main().catch((error) => {
+		console.log('× 异常: ' + String((error && error.message) || error));
+		process.exit(1);
+	});
+}

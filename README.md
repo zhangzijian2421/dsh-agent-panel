@@ -126,6 +126,7 @@ node test/client-panel.test.mjs   # 客户端面板：RPC 路径与字段名、�
 node test/mention-codec.test.mjs  # mention 编码与 shipped codec 逐字节兼容
 node test/mention-filter.test.mjs # @ 过滤语义：保留自己的树、丢弃他人的、失败降级
 node test/blank-trigger.test.mjs  # 空会话触发器：两个席位、blank 门控、不重复渲染
+node test/verify-script.test.mjs # 实机验证脚本的版本判定（v1/v2 与坏载荷不误判）
 ```
 
 ---
