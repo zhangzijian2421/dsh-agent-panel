@@ -112,6 +112,7 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 node test/store.test.mjs          # 注册表：坏文件降级、成员软删除、原子写
 node test/group-service.test.mjs  # 建群/拉人/状态/移除/解散（桩 ctx 走全流程）
 node test/plugin-mount.test.mjs   # 插件外壳：路由/工具注册、loopback 围栏、坏 JSON 体
+node test/client-panel.test.mjs   # 客户端面板：RPC 路径与字段名、两步确认、错误渲染（VM + 桩 React）
 node test/mention-codec.test.mjs  # mention 编码与 shipped codec 逐字节兼容
 node test/mention-filter.test.mjs # @ 过滤语义：保留自己的树、丢弃他人的、失败降级
 node test/blank-trigger.test.mjs  # 空会话触发器：两个席位、blank 门控、不重复渲染
@@ -127,6 +128,13 @@ node tools/read-session.mjs <会话存储目录或 .zstd 文件> [--tools] [--al
 
 DSH 的会话日志是**多帧 zstd** 的 JSONL（Node 的一次性解压只读第一帧），这个脚本按 zstd magic 逐帧解压，
 并把 `request/header` 里的工具面打出来——排查"成员到底拿到了哪些工具"时非常有用。
+
+```bash
+node tools/verify-group.mjs [--keep] [--cwd <dir>] [--preset <id>]
+```
+
+对着本机 GUI 的 HTTP 面跑一遍**端到端实机验证**：建群 → 拉人 → 读状态（成员与状态）→ 移出 → 解散。
+先探测 `/state` 是否已是 v2，未重启时会直接说明并退出，不会动任何东西；`--keep` 保留验证群以便在 GUI 里手看。
 
 ---
 
