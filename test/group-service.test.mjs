@@ -69,6 +69,7 @@ function makeHost(options) {
 		resumes: [],
 		selects: [],
 		drained: [],
+		disposed: [],
 		startFails: (options && options.startFails) || null,
 		selectFails: (options && options.selectFails) || null,
 		presetByAgent: new Map(),
@@ -78,9 +79,21 @@ function makeHost(options) {
 	function makeAgent(id, cwd, preset) {
 		return {
 			id,
+			status: 'idle',
 			ctx: { agentId: id },
 			options: { provider: 'deepseek-official', model: 'deepseek-flash' },
 			session: { header: { cwd, agentPreset: preset } }
+		}
+	}
+	/** `AgentHandle`：句柄持有者才能把 agent 从活会话表里摘掉（dispose 是能力）。 */
+	function makeHandle(agent) {
+		return {
+			agent,
+			async dispose() {
+				state.disposed.push(agent.id)
+				state.agents.delete(agent.id)
+				state.sessions.delete(agent.id)
+			}
 		}
 	}
 	const ctx = {
@@ -94,14 +107,15 @@ function makeHost(options) {
 						const agent = makeAgent(options2.sessionId, options2.meta.cwd, options2.meta.agentPreset)
 						state.agents.set(agent.id, agent)
 						state.sessions.set(agent.id, { id: agent.id, header: { cwd: options2.meta.cwd, agentPreset: options2.meta.agentPreset } })
-						return { agent }
+						return makeHandle(agent)
 					},
 					async resume(options2) {
 						state.resumes.push({ id: options2.resumeSessionId, agentOptions: options2.agentOptions })
 						if (typeof options2.setup === 'function') await options2.setup({ agentId: options2.resumeSessionId })
 						const agent = makeAgent(options2.resumeSessionId, 'D:\\work', 'standard')
 						state.agents.set(agent.id, agent)
-						return { agent }
+						state.sessions.set(agent.id, { id: agent.id, header: { cwd: 'D:\\work', agentPreset: 'standard' } })
+						return makeHandle(agent)
 					}
 				}
 			}
@@ -151,6 +165,8 @@ function makeHost(options) {
 				return { get: (id) => state.sessions.get(id) }
 			}
 			if (name === 'sessionController') {
+				// 静态插件里 controller 通常**不可用**；noController 用来跑那条兜底路径（它才拿得到句柄）。
+				if (options && options.noController === true) return undefined
 				return {
 					async ensureSession(id, cwd, check, preset) {
 						state.ensureCalls.push({ id, cwd, check, preset })
@@ -528,6 +544,35 @@ await check('解散：释放成员 + 归档会话 + 清注册表', async () => {
 		assert.deepEqual(host.state.drained[0].ids, [memberId])
 		assert.deepEqual(host.state.archived, [groupId])
 		assert.deepEqual((await service.state()).groups, [])
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('解散：持有句柄时把群主 agent 也下线（否则归档删除会跳过整族）', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost({ noController: true })
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const created = await service.createGroup({ session_id: 'session-g', preset_id: 'standard', name: '验证群' })
+		assert.equal(created.ok, true, created.error)
+		assert.equal(host.state.resumes.length, 1, '兜底路径自己 resume（这条路径句柄归我们）')
+		const dissolved = await service.dissolve({ group_id: created.id })
+		assert.equal(dissolved.owner_released, 'disposed')
+		assert.deepEqual(host.state.disposed, [created.id])
+		assert.equal(dissolved.owner_live, false)
+		assert.equal(dissolved.delete_hint, undefined, '群主已下线，不需要重启提示')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('解散：句柄不在我们手里（GUI 拉的）时如实报告仍需重启', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const created = await service.createGroup({ session_id: 'session-g', preset_id: 'standard', name: '验证群' })
+		const dissolved = await service.dissolve({ group_id: created.id })
+		assert.equal(dissolved.owner_released, 'not-owned')
+		assert.equal(dissolved.owner_live, true)
+		assert.match(dissolved.delete_hint, /重启一次 DSH/)
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('改名：注册表 + 会话标题（带 👥 前缀）一起改', async () => {

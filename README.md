@@ -120,6 +120,19 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 - **第一轮的工具面可能比后续窄**：某些 preset（如 `liangshen`）用 `anchorTools` 把**首个用户轮**的 wire
   收敛到 4 个工具（`bash`/`str_replace_editor`/`exit_plan_mode`/`skill`），第二轮起才恢复完整工具面
   （`ptcPresentation`）。这也是"成员在第一轮里找不到 `send_message`"的原因，不是子代理被禁。
+- **归档 ≠ 删除，而且"live 的会话删不掉"**（实机踩过："群聊归档删除后删不掉，子 agent 会话也没删"）。
+  设置里的会话归档/删除来自第三方插件 `@linxin666/dsh-session-archive`，它的删除有三条硬规则：
+  1. 删除是**整族级联**的：以会话头的 `parentSession` 为边，选父会话会带上全部后代；
+  2. 但**进程内仍然 live 的会话受保护**（原因 `attached`：会话仍被 DSH 进程占用），
+     正在跑的是 `running`，你当前正在看的是 `current`；
+  3. 族里只要有受保护成员，**整族跳过**（`family-protected`）；而且父会话自身受保护时，
+     它的后代**根本不会被算进删除目标**——这就是"群聊删不掉、成员会话也留着"的直接原因。
+  DSH 本身把打开的会话长期留在内存里（GUI 的启动路径 `(await agents.resume(...)).agent` 当场丢掉句柄，
+  整轮进程冷不下来），所以正确顺序是：
+  **面板里「解散群聊」（释放全部成员，并尽力把群主 agent 也下线）→ 需要就重启一次 DSH →
+  在「设置 → 会话归档」里勾选该会话族删除**。销毁后不要再打开那个群会话，否则它又会 live。
+  解散的返回值里有 `owner_released` / `owner_live` / `delete_hint`：句柄不在插件手里（GUI 自己 resume
+  的会话）时会如实告诉你"还需重启"。
 - **成员之间不能直接互发消息**：`subagents.sendMessage` 的权威是"相邻父子"，兄弟会话之间没有通道；
   成员只能向群主汇报，由群主转达。
 - **成员能力面 = 群主的 preset**：子 agent 通过 `agentPresets.composeFrom(childCtx, parent.ctx)` 加入父会话的
