@@ -32,7 +32,10 @@
   - 群预设会话在**首次步进**时就会自动写入空名册（`agent/pre-step` 钩子），
     因此「新建群预设会话 → 发第一条消息 → 直接拉人」成立，无需任何初始化动作
   - 也可调用 `POST /init` 显式创建
-- 拉人可选 **「以完整能力运行」**：拉起后对子代理执行 `agentPresets.recompose` 换装为该 preset，**获得其真实工具集**（不只是人格）。已用行为实验验证：一个没有 `read` 工具的子代理，recompose 成 `standard` 后成功用 `read` 读取文件。聊天群成员自动忽略此选项（保持群工具）
+- **空/未启动会话也能直接拉人**：目标会话还没有常驻 Agent 时，`pull` 会先调用
+  `sessionController.ensureSession(sessionId, cwd, true, 该会话已选预设)` 把它启动起来
+  （复用在线 agent / 恢复冷会话 / 按该会话的预设创建），再拉人；返回 `autoStarted: true`
+  —— 未启动的会话在面板里不再显示为「无法拉人」，拉人按钮始终可用
 
 ### 2. 成员状态与移出
 
@@ -96,7 +99,7 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 |---|---|---|
 | GET | `/api/dsh-agent-panel/state` | 在线会话 + 各自的成员/已移除/频道消息 + 已安装 preset |
 | GET | `/api/dsh-agent-panel/subagents?sessionId=` | 单个会话的子 agent（按 agent 名，已排除已移出） |
-| POST | `/api/dsh-agent-panel/pull` | `{sessionId, cwd?, ownerId?, presetId, name?, fullCapability?}` |
+| POST | `/api/dsh-agent-panel/pull` | `{sessionId, cwd?, ownerId?, presetId, name?}` — 会话未启动时自动启动；无群目录时自动建群 |
 | POST | `/api/dsh-agent-panel/retire` | `{sessionId, cwd?, memberId}` |
 | POST | `/api/dsh-agent-panel/restore` | `{sessionId, memberId}` |
 | POST | `/api/dsh-agent-panel/init` | `{sessionId, cwd?, name?}` — 显式创建群目录与空名册（正常流程由群预设自动完成） |
@@ -112,9 +115,10 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 - **鸭子类型 AbortSignal**：`startContinuable` 强制要 signal，而动态沙箱里没有 `AbortController`；`dsh-subagent` 只调用 `throwIfAborted()`、读 `aborted`、增删 `abort` 监听，故用一个永不中止的等价对象即可
 - **工具黑名单降级**：`tools.restrict()` 按**父会话工具域**校验 deny 名字，报错信息里会列出真实域名；解析它做精确裁剪，避免整次拉人失败
 - **写策略显式化**：`fs.writeText` 默认策略会拒绝点路径（`.agent-group`）；显式传 `{mode:'workspace-write', workspaceRoot}` 后干净通过（不滥用 danger-full-access）
-- **完整能力模式**：拉起后对子代理作用域执行 `agentPresets.recompose(childCtx, presetId)`（DSH 官方的「会话换 preset」机制），子代理即拥有该 preset 的真实工具面。聊天群成员豁免（recompose 会剥掉群工具）
+- **自动启动未启动会话**：`sessionController.ensureSession(sessionId, cwd, true, preset)` —— 与 GUI 启动会话同一条宿主路径（adopt 在线 / resume 冷会话 / 按会话自带预设 create）；`preset` 取 `session.header.agentPreset`，避免用默认预设覆盖用户的选择
 - **多群目录解析**（`resolveGroupDir`）：新布局 `groups/<ownerSessionId>/` 优先；旧布局仅当名册 owner 匹配时沿用；名册读取失败一律按「不存在」处理，绝不因此让拉人失败
-- **群目录自动就绪**：群预设（`agent-chat-group/group.mjs`）在会话首次步进的 `agent/pre-step`（waterfall，监听器必须 `return next()`）里后台写入空名册——群目录的存在本身就是「这是群」的标记，前端无需检测或初始化。面板在 `pull` 时对「名册尚未出现」做 5×300ms 的窄竞态重试
+- **面板自带群工具**（`installGroupTools`）：`group_send` / `group_read` / `group_members` 注册在插件自身的根作用域，调用时用 `callerGroup` 按调用者会话解析群目录（主持人取自身、成员取 `parentSession`），无群目录则明确报错
+- **群目录自动就绪**：群预设（`agent-chat-group/group.mjs`）在会话首次步进的 `agent/pre-step`（waterfall，监听器必须 `return next()`）里后台写入空名册——群目录的存在本身就是「这是群」的标记，前端无需检测或初始化
 
 **浏览器半边**（`lib/client.js`）
 
@@ -139,7 +143,8 @@ node test/mention-filter.test.mjs   # @ 过滤语义：保留自己的树、丢�
 ## 已知边界
 
 - **原生子代理条不可删/改名**：DSH 的 `dsh-subagent` 没有删除原语，子代理是「可冷恢复」的持久化实体，原生 UI 的记录会永久保留（惰性、不运行）。本插件的「移出」= 释放 + 名册/墓碑清理，属于 DSH 语义内的上限
-- **完整能力模式不适用于聊天群成员**：recompose 会剥掉群工具（group_send 等），聊天群成员自动忽略该选项
+- **无 cwd 的会话不列出**：中途创建、还没绑定工作目录的会话（`header.cwd` 为空）不会进入面板目标列表；正常从界面新建的会话都带 cwd
+- **群工具是全局注册**：`group_send` / `group_read` / `group_members` 对每个会话的工具面都可见（调用时按会话守卫，无群目录会报错）。群预设会话里 preset 的同名工具按作用域就近解析，两者语义一致（同一份 roster/chat.log）
 - 插件为进程级单例面板：状态里的会话枚举是全量的，会话很多时首次打开会有一次遍历
 - `cwd` 的路径分隔符按首次出现推断（Windows `\` / POSIX `/`），混用盘符的极端场景未覆盖
 
