@@ -96,6 +96,68 @@ SessionReferenceResolver ..> Session : @候选 = 除自己外的全部会话
 2. **`@` 引用菜单没有「子代理」概念。** 它列出除自己外的**所有**会话，
    按 cwd 亲缘排序；别人的子代理继承其父 cwd，反而排在前面。
 
+### 1.1 类图 ≠ 对象图：Preset 与 Agent 到底怎么连起来
+
+上面的图是**类图**：线表示「类与类的关系」，线上的倍率（`0..1`）才是数量约定——
+**每个会话实例**最多绑定 1 个 preset、最多挂 1 个常驻 Agent。
+现实世界里有**很多会话实例**（各绑不同 preset、父子相挂），那是对象图（实例图）的事。
+「Session 连着多个 Preset 和多个 Agent」只是把所有实例折叠进一个类后的视觉效果。
+
+**Preset 和 Agent 之间没有直接关系**——它们靠「会话作用域」间接关联：
+
+```mermaid
+classDiagram
+direction TB
+class sessionA["Session 实例：会话A（绑定 minimal）"]
+class presetMinimal["Preset 实例：minimal"]
+class compositionMinimal["组合行实例：minimal 的工具行+人格行"]
+class scopeA["会话A 的作用域（挂了 minimal 的行）"]
+class agentA["Agent 实例：会话A 的常驻执行体"]
+class sessionChild["Session 实例：会话A 的子会话（origin=subagent）"]
+class descriptor["SubagentDescriptor 实例：label=创造模式助手"]
+class scopeChild["子作用域（父作用域的子层，默认继承 minimal 的行）"]
+class agentChild["Agent 实例：子执行体"]
+class presetCordis["Preset 实例：cordis"]
+
+sessionA --> presetMinimal : 创建时绑定（binding 记录在作用域上）
+presetMinimal *-- compositionMinimal : 组合行
+sessionA --> scopeA : 创建会话作用域
+compositionMinimal --> scopeA : 挂载（工具行→工具层，人格行→提示词层）
+sessionA --> agentA : 常驻执行体
+agentA --> scopeA : 每个模型步从作用域取工具/提示词
+sessionA --> sessionChild : parentSession（派生子代理）
+sessionChild --> descriptor : subagent/descriptor 事件（出生证明）
+sessionChild --> scopeChild : 子作用域（父作用域的子层）
+scopeChild ..> scopeA : 默认继承父层挂过的行（=工具继承）
+sessionChild --> agentChild : 子执行体
+agentChild --> scopeChild : 从子作用域取工具/提示词
+scopeChild ..> presetCordis : 完整能力=recompose 换绑到 cordis
+agentChild --> presetCordis : 换装后工具/人格来自 cordis
+```
+
+**关联链条（Preset 与 Agent 永不直接握手）**：
+
+```
+创建会话（选定 preset）
+  → agentPresets 把该 preset 的组合行【挂载】进会话作用域
+      · 工具行 → 作用域工具层
+      · 人格行 → 作用域提示词层
+  → Agent 在该作用域里创建
+  → 每个模型步，Agent 从自己的作用域取工具与提示词段
+```
+
+**三个澄清**：
+
+1. **子代理不「包含」Preset/Agent 的实现。** 拉人创建的是一对新的
+   Session + Agent；它的特殊性只有两点：`origin='subagent'` + `parentSession`
+   血缘，以及把 `SubagentDescriptor` 写进子会话日志（出生证明）。
+2. **工具继承 = 作用域分层**。子作用域是父作用域的子层，默认看到父层挂过的行；
+   换句话说「工具继承」不是复制，而是作用域查找的回退。
+3. **绑定记录的回落（实测）**：子作用域自己没有 preset 绑定时，
+   `composedPreset(childCtx)` 回落到**部署根绑定**（本机为 cordis），
+   而不是父会话的绑定——所以「子代理的 preset 绑定」语义比想象中更弱，
+   也解释了为什么 `@` 过滤实验里能看到各种回落现象。
+
 ---
 
 ## 2. 安装本插件后：聊天群 + 完整能力开关
