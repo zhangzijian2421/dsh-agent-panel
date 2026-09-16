@@ -55,8 +55,13 @@ group-<uuid>            ← 群主会话（root 会话，preset 建群时指定�
 把群主会话启动起来有**两条路**：首选 GUI 自己的 `sessionController.ensureSession`
 （adopt 在线 / resume 冷会话 / create 新会话，并把 preset 写进会话头）；但 `sessionController`
 不在 cordis 的公开 catalog 里，所以缺席时自动兜底到 catalog 内的原语
-`agents.create` / `agents.resume` + `agentPresets.mount`——也就是 api-session-controller
+`agents.create` / `agents.resume` + `agentPresets.mount` + `agentOptions`——也就是 api-session-controller
 内部 `composeAgent()` 的同一条路。两条路都有单测覆盖。
+
+**实机验证的结论**：静态插件里 `sessionController.ensureSession` **不可用**（`createGroup` 回报的
+`started_via` 是 `agents.create`），所以这条兜底其实是**主路径**；而最早的版本漏了 `agentOptions`，
+导致建出来的群主 agent 没有 provider/model（症状：群主报 `{{model}}` 无值、成员报
+`no provider/model`）——现在建群时会检查并如实失败。
 
 ---
 
