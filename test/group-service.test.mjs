@@ -70,7 +70,8 @@ function makeHost(options) {
 		drained: [],
 		startFails: (options && options.startFails) || null,
 		selectFails: (options && options.selectFails) || null,
-		presetByAgent: new Map()
+		presetByAgent: new Map(),
+		titleBySession: new Map()
 	}
 	let child = 0
 	function makeAgent(id, cwd, preset) {
@@ -158,6 +159,12 @@ function makeHost(options) {
 						state.presetByAgent.set(id, String(preset))
 						return agent
 					}
+				}
+			}
+			if (name === 'sessionTitle') {
+				return {
+					rename: (session, title) => { state.titles.push({ id: session.id, title }); state.titleBySession.set(String(session.id), String(title)) },
+					get: (session) => ({ title: state.titleBySession.get(String(session.id)) || '' })
 				}
 			}
 			if (name === 'workspaceRegistry') {
@@ -419,6 +426,41 @@ await check('群主离线时移除：只标记名册并给出说明', async () =
 		assert.equal(released.ok, true)
 		assert.equal(released.released, false)
 		assert.match(released.note, /未驻留/)
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+console.log('group: 标题自愈（👥 前缀）')
+await check('在线群会话缺 👥 前缀时自愈，且不重复刷', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		assert.ok(host.state.titles.some((row) => row.title === '👥 验证群'), '建群即写 👥 标题: ' + JSON.stringify(host.state.titles))
+		// 模拟"老群"：当前标题里没有 👥 前缀（只清日志不够，要清真正的当前标题）
+		host.state.titles.length = 0
+		host.state.titleBySession.clear()
+		await service.state()
+		const renamed = host.state.titles.filter((row) => row.title === '👥 验证群').length
+		assert.ok(renamed >= 1, 'state() 应自愈标题')
+		const before = host.state.titles.length
+		await service.state()
+		await service.state()
+		assert.equal(host.state.titles.length, before, '标题已正确时不再刷')
+	} finally { rmSync(dir, { recursive: true, force: true }) }
+})
+await check('pull 自愈标题：拉人时老群的标题也会补上', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'agrp-group-'))
+	try {
+		const host = makeHost()
+		host.state.sessions.set('session-g', { id: 'session-g', header: { cwd: 'D:\\work', agentPreset: 'minimal' } })
+		const service = createGroupService(host.ctx, { registryFile: join(dir, 'groups.json') })
+		const created = await service.createGroup({ session_id: 'session-g', cwd: 'D:\\work', preset_id: 'standard', name: '验证群' })
+		host.state.titles.length = 0
+		host.state.titleBySession.clear()
+		const pulled = await service.pull({ group_id: created.id, preset_id: 'se' })
+		assert.equal(pulled.ok, true, pulled.error)
+		assert.equal(host.state.titleBySession.get(created.id), '👥 验证群', '拉人应自愈标题')
 	} finally { rmSync(dir, { recursive: true, force: true }) }
 })
 await check('解散：释放成员 + 归档会话 + 清注册表', async () => {
