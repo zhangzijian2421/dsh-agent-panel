@@ -122,8 +122,8 @@ console.log("dock seat — blank session (the reported bug)");
 	const button = node === null ? undefined : node.children[0].type();
 	check("inner component yields a real <button>", button !== undefined && button.type === "button");
 	check(
-		"button label is 群聊拉人",
-		button !== undefined && String(button.children[0]).includes("群聊拉人"),
+		"button label is 群聊",
+		button !== undefined && String(button.children[0]).includes("群聊"),
 		button === undefined ? "no button" : JSON.stringify(button.children)
 	);
 }

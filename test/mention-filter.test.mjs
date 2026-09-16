@@ -1,10 +1,10 @@
 /**
- * Logic test for the `@` menu filter (src: lib/index.js installMentionFilter).
+ * Logic test for the `@` menu filter (src: lib/mention.js installMentionFilter).
  * No test runner: plain node, fake resolver + fake sessionQuery, assertions by hand.
  *
  * Run: node test/mention-filter.test.mjs
  */
-import { installMentionFilter } from '../lib/index.js'
+import { installMentionFilter } from '../lib/mention.js'
 
 const SELF = 'session-self'
 const OTHER = 'session-other'

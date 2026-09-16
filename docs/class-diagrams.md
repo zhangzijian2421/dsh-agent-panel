@@ -3,6 +3,12 @@
 > 依据 DSH 0.1.5-rc.1 运行时源码阅读与行为实验整理；为可读性做了简化，
 > 只列出与本插件相关、且**实际验证过**的属性与方法。
 
+> ⚠️ **本文描述的是 v1（"我的会话就是群"、workspace 群目录 + roster.json/chat.log）的类关系。**
+> v2 已改为「群聊 = 独立群主会话 + 具名常驻子代理」，插件不再自建群目录/频道/群工具；
+> 各类的原生关系（Session / Agent / Preset / SubagentDescriptor）仍然成立且仍然值得读，
+> 但凡是提到 `roster.json`、`chat.log`、群目录、`group_*` 工具的地方都已是历史。
+> v2 的架构与取舍见 [`group-above-session.md`](group-above-session.md) 与根目录 README。
+
 ## 0. 先分清四个词（大白话）
 
 | 词 | 是什么 | 一句话 |

@@ -1,138 +1,106 @@
-# dsh-agent-panel
+# @zijians-bow-is-long/dsh-agent-panel
 
-给 DeepSeek Harness Web GUI 用的 **Agent 拉人面板** 插件：在任意会话右上角把已安装的 agent preset「拉」进当前会话成为常驻成员，并在 `@` 菜单里用 agent 名引用它们。
+给 DeepSeek Harness Web GUI 用的**群聊面板**：在 GUI 里建一个独立群聊、把已安装的 agent preset 拉成群的常驻成员，并在 `@` 菜单里按成员名引用它们。
 
-一个包同时挂 **宿主半边**（loopback HTTP 路由 + 模型工具 `agrp_pull`）和 **浏览器半边**（会话标题栏触发器 + 下拉面板 + `@` 菜单新分组）。
-
----
-
-## 功能
-
-### 1. 面板：把 agent 拉进会话
-
-- 会话右上角 `👥 群聊拉人` → 就地弹出面板
-- **空会话（还没发过第一条消息）同样有按钮**：DSH 原生的会话头部在空白态整块隐藏
-  （`ConversationSessionHeader` 只在 `!session.blank` 时渲染），挂在头部里的按钮那时**根本不存在**；
-  因此本插件在 composer 上方的 `conversation.input.dock` 补了一个**只在空白态显示**的同一按钮，
-  会话一旦开始就自动让位给右上角那个（不会重复出现）
-- 列出**全部在线会话**做目标（当前会话排第一并标「当前」，可切换）
-- 列出**已安装 preset**，点「拉入本会话」即拉起一个常驻子 agent：
-  - 人格取自该 preset 的 `persona.prefix`（`|` / `>` 各种标量块都支持）
-  - 成员名自动去重（重名 `-2` / `-3`）
-  - `maxDepth=1`（成员不能再往下拉人）
-  - 工具黑名单按目标会话的工具域**自动降级**，不会因为名字不认识而失败
-- **任何会话拉人都会自动变群**（第 1 档行为）：目标会话没有群目录时，`pull` 会先为它创建
-  `groups/<会话id>/roster.json`，再写入成员与系统消息——面板随即把它显示为聊天群
-  （返回 `autoGrouped: true`）
-- **群工具由面板自己提供**（第 3 档）：`group_send` / `group_read` / `group_members` 由本插件
-  在根作用域注册（与 `agrp_pull` 同层），每次调用按**调用者会话**在运行期解析群目录：
-  - 主持人 → 自己会话的群；成员（子代理）→ 其**父会话**的群
-  - 因此**成员一定有群工具**（子作用域能解析根注册的工具），**不依赖会话是否使用群预设**
-  - 没有群目录的会话调用会得到明确错误（提示先在面板拉人自动建群），不是静默失败
-  - 群预设会话里 preset 的同名工具按作用域就近解析（两者语义一致：同一份 roster/chat.log）
-- **一个工作区支持多个互相独立的群聊**：每个群一个目录
-  `<cwd>/.agent-group/groups/<群主会话id>/{roster.json,chat.log}`，
-  同一个工作区里开多个聊天群会话互不干扰；旧布局（整工作区单群）继续兼容
-  - 群预设会话在**首次步进**时就会自动写入空名册（`agent/pre-step` 钩子），
-    因此「新建群预设会话 → 发第一条消息 → 直接拉人」成立，无需任何初始化动作
-  - 也可调用 `POST /init` 显式创建
-- **空/未启动会话也能直接拉人**：目标会话还没有常驻 Agent 时，`pull` 会先调用
-  `sessionController.ensureSession(sessionId, cwd, true, 该会话已选预设)` 把它启动起来
-  （复用在线 agent / 恢复冷会话 / 按该会话的预设创建），再拉人；返回 `autoStarted: true`
-  —— 未启动的会话在面板里不再显示为「无法拉人」，拉人按钮始终可用
-- **当前会话永远是可选目标**：即使它没有被列入状态（例如 `header.cwd` 为空），面板也会把它补进
-  目标列表；`pull` 在缺 `cwd` 时按会话自身解析工作目录，所以这个目标依然可用
-
-### 2. 成员状态与移出
-
-- 实时状态 `running` / `idle` / `ready`
-- 每名成员带两步确认的「移出」：释放子 agent（`drainContinuableChildren`）+ 聊天群同步改名册与频道
-- 移出记录**落盘**在 `~/.dsh/dsh-agent-panel-retired.json`，跨重启生效
-- 被移出的成员进入「已移除」分区（灰显 + `[已移除]`），可一键「恢复」显示
-- 名册写入失败时**不做任何改动**并报错，不会出现「名册删了人还在」的脏状态
-
-### 3. `@` 菜单
-
-- **新增分组「本会话子 agent」**：名字是 **agent 名**（拉人时定的成员名），不是会话标题；副标题显示 `常驻成员/一次性 · 运行中/待命`
-  - 选中后插入的是**规范会话引用** `@[名](dsh-session:…)`，走 DSH 原生的 session-reference 上下文注入（选中该 agent 会话的快照注入 prompt），不是死文本
-- **过滤噪音**：隐藏「其他会话的子代理」，只保留根会话 + 本会话自己的子 agent 树
-
-### 4. 模型工具
-
-- `agrp_pull`：与前端口径完全一致，供 agent 侧直接拉人（省略 `preset_id` 时返回当前状态）
+> **v2 架构：群聊在 session 之上。** 一个群 = 一个由本插件创建的**独立群主会话**，成员 = 它的具名常驻子代理，频道 = 群主会话自己的记录。
+> 不再往你的工作区里撒 `.agent-group/` 目录，也不再自建 roster.json / chat.log / 群工具 / 墓碑。
 
 ---
 
-## 安装
+## 快速开始
 
-包形态遵循 DSH 官方 bundle 形状：`package.json` 的 `dsh.client` 声明浏览器半边，`dsh.bundle.patch` 指向 `cordis.patch.yml`（装载两半的那一行）。
+安装（profile 里已有这一行时跳过）：
 
 ```bash
-# 方式 A：官方 CLI（推荐）
-dsh plugin --profile web add link:<本仓库路径或 URL>
+dsh plugin --profile web add @zijians-bow-is-long/dsh-agent-panel
+# 或手动：把包放进 ~/.dsh/profiles/web/node_modules/，并加入 package.json 的 dsh.profile.bundles
 ```
 
-```yaml
-# 方式 B：手动装进 profile
-# 1) 把包放进 <profile>/node_modules/<包名>（junction / 复制均可）
-# 2) 在 <profile>/cordis.patch.yml 里插入一行：
-- insert:
-    - id: agent-panel
-      name: '@zijians-bow-is-long/dsh-agent-panel'
-```
+使用：
 
-装完 **重启 DSH**，刷新页面。
-
-安装位置参考（Windows）：
-
-| 项 | 路径 |
-|---|---|
-| Profile | `%USERPROFILE%\.dsh\profiles\web\` |
-| 包 | `<profile>\node_modules\@zijians-bow-is-long\dsh-agent-panel`（可直接 junction 到本仓库） |
-| 启用行 | `<profile>\cordis.patch.yml` 或 `<profile>\package.json` 的 `dsh.profile.bundles` |
-
-> **注意（踩过的坑）**：某些 profile 配了 pnpm 供应链策略（`minimumReleaseAge`），会让 `dsh plugin add` 因**既有 lockfile** 里较新的包而整体失败。此时用手动方式（方式 B）等价、且不动 lockfile。
->
-> 另外：本插件的 `@` 菜单过滤会包装 shipped 的 `sessionReferenceResolver.listCandidates`（运行时可逆，不改任何文件）。若上游重命名该方法，过滤会静默失效（退回原行为），面板其余功能不受影响。
+1. 点会话右上角（或**空会话** composer 上方）的「👥 群聊」按钮打开面板。
+2. 面板里选「创建群聊」的 preset（默认 `standard`，**它决定全群成员的能力上限**），点「创建群聊」。
+   插件会创建一个独立会话 `group-<uuid>`，预设名写进会话标题（会话列表里就叫「群聊 · 1」）。
+3. 在「拉进本群」列表里点任意 preset 的「拉入本群」：该 preset 的 persona 成为成员人格，
+   成员挂到群主会话下（`maxDepth=1`），群内名字自动去重（重名退避 `-2` / `-3`）。
+4. 点「打开群聊会话」进群说话：群主就是那个会话的 agent，成员用原生 `send_message` 向它汇报，
+   这些消息**原生落在群主会话的记录里**——频道不需要插件自己造。
+5. 成员 chip 上的「移出」（两步确认）= 原生释放子代理 + 名册软删除；「解散群聊」= 释放全部成员 + 归档群主会话。
 
 ---
 
-## HTTP API
+## 架构
 
-全部限定 loopback（同机浏览器），返回 JSON：
+```
+group-<uuid>            ← 群主会话（root 会话，preset 建群时指定，默认 standard）
+   ├── 成员 A           ← 续存型子代理：label = 群内名字，persona = 被拉 preset 的 persona
+   ├── 成员 B              toolFilter = 成员黑名单，maxDepth = 1
+   └── …
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/dsh-agent-panel/state` | 在线会话 + 各自的成员/已移除/频道消息 + 已安装 preset |
-| GET | `/api/dsh-agent-panel/subagents?sessionId=` | 单个会话的子 agent（按 agent 名，已排除已移出） |
-| POST | `/api/dsh-agent-panel/pull` | `{sessionId, cwd?, ownerId?, presetId, name?}` — 会话未启动时自动启动；无群目录时自动建群 |
-| POST | `/api/dsh-agent-panel/retire` | `{sessionId, cwd?, memberId}` |
-| POST | `/api/dsh-agent-panel/restore` | `{sessionId, memberId}` |
-| POST | `/api/dsh-agent-panel/init` | `{sessionId, cwd?, name?}` — 显式创建群目录与空名册（正常流程由群预设自动完成） |
+频道 = 群主会话自己的会话记录（成员 send_message → 父会话，原生 inbox 消息）
+名册/状态 = 原生子代理目录（subagents.listChildren：running / idle / inactive）
+唤醒/转达 = 群主 agent 自带的 send_message
+唯一自建状态 = ~/.dsh/dsh-agent-panel/groups.json（哪些会话是群、群名、群主 preset、成员当初用哪个 preset 拉的）
+```
+
+三段代码：
+
+| 文件 | 职责 |
+| --- | --- |
+| `lib/store.js` | 注册表：纯函数 + 原子文件读写（坏文件降级成空注册表，永不抛） |
+| `lib/group.js` | 群聊服务：建群 / 拉人 / 移除 / 恢复 / 解散 / 状态；persona 提取、黑名单降级 |
+| `lib/index.js` | 插件外壳：8 条 loopback 路由 + 2 个模型工具 + `@` 菜单过滤 |
+| `lib/mention.js` | `@` 候选过滤（隐藏"别的会话的子代理"），与群模型无关 |
+| `lib/client.js` | 浏览器半边：触发器（会话头部 + 空会话 dock）、面板 UI、`@` 源 |
 
 ---
 
-## 架构要点
+## HTTP API（仅 loopback）
 
-**宿主半边**（`lib/index.js`）
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/api/dsh-agent-panel/state` | 群聊列表 + 成员 + preset 列表 + 服务可用性 |
+| POST | `/api/dsh-agent-panel/group-create` | 建群：`{session_id?｜cwd?, preset_id?, name?}` |
+| POST | `/api/dsh-agent-panel/group-rename` | 改名：`{group_id, name}`（同时写会话标题） |
+| POST | `/api/dsh-agent-panel/group-dissolve` | 解散：`{group_id}` |
+| POST | `/api/dsh-agent-panel/pull` | 拉人：`{group_id, preset_id, name?}` |
+| POST | `/api/dsh-agent-panel/release` | 移出：`{group_id, member_id}` |
+| POST | `/api/dsh-agent-panel/restore` | 恢复显示：`{group_id, member_id}` |
+| GET | `/api/dsh-agent-panel/members?sessionId=` | 某会话自己的常驻成员（`@` 菜单用） |
 
-- 只硬依赖 `webServer`；`fs` / `sessions` / `agents` / `subagents` / `agentPresets` 全部 `ctx.get` 判空，缺失时在对应路由报错
-- 拉人走 `subagents.startContinuable({provider:'spawn', request:{parent, persona, toolFilter, maxDepth}})`
-- **鸭子类型 AbortSignal**：`startContinuable` 强制要 signal，而动态沙箱里没有 `AbortController`；`dsh-subagent` 只调用 `throwIfAborted()`、读 `aborted`、增删 `abort` 监听，故用一个永不中止的等价对象即可
-- **工具黑名单降级**：`tools.restrict()` 按**父会话工具域**校验 deny 名字，报错信息里会列出真实域名；解析它做精确裁剪，避免整次拉人失败
-- **写策略显式化**：`fs.writeText` 默认策略会拒绝点路径（`.agent-group`）；显式传 `{mode:'workspace-write', workspaceRoot}` 后干净通过（不滥用 danger-full-access）
-- **自动启动未启动会话**：`sessionController.ensureSession(sessionId, cwd, true, preset)` —— 与 GUI 启动会话同一条宿主路径（adopt 在线 / resume 冷会话 / 按会话自带预设 create）；`preset` 取 `session.header.agentPreset`，避免用默认预设覆盖用户的选择
-- **多群目录解析**（`resolveGroupDir`）：新布局 `groups/<ownerSessionId>/` 优先；旧布局仅当名册 owner 匹配时沿用；名册读取失败一律按「不存在」处理，绝不因此让拉人失败
-- **面板自带群工具**（`installGroupTools`）：`group_send` / `group_read` / `group_members` 注册在插件自身的根作用域，调用时用 `callerGroup` 按调用者会话解析群目录（主持人取自身、成员取 `parentSession`），无群目录则明确报错
-- **群目录自动就绪**：群预设（`agent-chat-group/group.mjs`）在会话首次步进的 `agent/pre-step`（waterfall，监听器必须 `return next()`）里后台写入空名册——群目录的存在本身就是「这是群」的标记，前端无需检测或初始化
+模型工具：`group_pull`（不带 `preset_id` 时返回群状态）、`group_create`。两者都在成员黑名单里——只有群主与宿主能用。
 
-**浏览器半边**（`lib/client.js`）
+---
 
-- `__ModuleLoader__.load({id, factory})` 形态；`inject: ["slots", "inputTriggers"]`
-- 面板挂在 `conversation.session.header.utilities`（正式会话的触发器）+ `conversation.input.dock`（**空白会话**的触发器，`session.blank` 门控，非空白返回 `null`）+ `shell.overlay`（下拉卡片）
-  - 空白态判定优先用 dock 的 owner prop `session.blank`，取不到时退回标准 props 的 `useSession((s) => s.blank)`；两者都没有就保持隐藏，宁可少显示也不重复出现两个按钮
-- `@` 源注册在 `ctx.inputTriggers.registerSource`，`order: -10` 排在 Sessions/Files 之前
-- **`@` 源的 `candidates` 永不 reject**（控制器会丢弃 fetch 失败的源），且**不提供 `header`**（那是「钻取面包屑」钩子，返回非空数组以外的东西会破坏菜单渲染）
+## v1 → v2 删掉了什么，为什么
+
+| v1 机制 | v2 |
+| --- | --- |
+| `<cwd>/.agent-group/groups/<owner>/{roster.json,chat.log}` + legacy 目录布局 | 群主会话 id + 原生子代理目录；注册表在 `~/.dsh/` |
+| 自己写的频道（`chat.log`、`seq` 序号、系统消息） | 群主会话自己的记录 |
+| 根作用域注册的 `group_send/group_read/group_members` + 每次调用反推群目录的 caller 守卫 | 原生 `send_message`（成员→群主）+ 群主自带的唤醒能力 |
+| "群目录存在 = 是群"的探测法（曾三度因信号不可靠而重写） | 显式注册表：哪些会话是群是记下来的，不是猜的 |
+| 群预设 `agent/pre-step` 自动写空名册 | 不需要：建群就是一次显式 API 调用 |
+| `~/.dsh/dsh-agent-panel-retired.json` 墓碑 + 内存态 | 注册表里的 `removedAt` 软删除 |
+| 运行时包装 `sessionReferenceResolver.listCandidates`（与群模型无关） | 保留（独立模块 `lib/mention.js`） |
+
+---
+
+## 已知边界（都是 DSH 的语义，不是插件缺陷）
+
+- **成员之间不能直接互发消息**：`subagents.sendMessage` 的权威是"相邻父子"，兄弟会话之间没有通道；
+  成员只能向群主汇报，由群主转达。
+- **成员能力面 = 群主的 preset**：子 agent 通过 `agentPresets.composeFrom(childCtx, parent.ctx)` 加入父会话的
+  preset。**"每个成员跑自己的 preset 工具面"在本版本不可实现**（四条路都实测封死，见
+  [`docs/group-above-session.md`](docs/group-above-session.md) §7）。所以群主请用 `standard` / `cordis`；
+  面板对 `minimal` 群主会显式告警（否则成员只有 `pwsh`）。角色差异用 persona + 成员黑名单表达。
+- **沙箱继承**：delegation 的沙箱取父会话的显式覆盖，审批固定 `never`——群主会话在 `workspace-write` 下时，
+  成员也在 `workspace-write` 下，需要审批的操作会被自动拒绝。
+- **原生子代理没有删除原语**：「移出」= 释放（`drainContinuableChildren`）+ 名册软删除；DSH 的持久记录
+  仍在（可冷恢复），面板用「已移除」区区分。群主不在线时只能标记名册。
+- **成员名单包含"群主自己拉的人"**：群主用原生 subagent 工具拉进来的子代理也会显示（标 `群主拉的`），
+  否则面板会"少人"。
+- **空会话的按钮**：DSH 的会话头部在空白态整块不渲染，所以空白会话用一个只在 blank 时出现的 dock 触发器顶上。
 
 ---
 
@@ -141,24 +109,36 @@ dsh plugin --profile web add link:<本仓库路径或 URL>
 不需要测试框架，纯 node：
 
 ```bash
-node test/mention-codec.test.mjs    # mention 编码与 shipped codec 逐字节兼容（含 ] \ emoji 转义）
-node test/mention-filter.test.mjs   # @ 过滤语义：保留自己的树、丢弃他人的、失败降级、可回滚
-node test/blank-trigger.test.mjs    # 空白会话触发器：头部席位 + dock 席位、blank 门控、不重复渲染
+node test/store.test.mjs          # 注册表：坏文件降级、成员软删除、原子写
+node test/group-service.test.mjs  # 建群/拉人/状态/移除/解散（桩 ctx 走全流程）
+node test/plugin-mount.test.mjs   # 插件外壳：路由/工具注册、loopback 围栏、坏 JSON 体
+node test/mention-codec.test.mjs  # mention 编码与 shipped codec 逐字节兼容
+node test/mention-filter.test.mjs # @ 过滤语义：保留自己的树、丢弃他人的、失败降级
+node test/blank-trigger.test.mjs  # 空会话触发器：两个席位、blank 门控、不重复渲染
 ```
 
 ---
 
-## 已知边界
+## 开发工具
 
-- **原生子代理条不可删/改名**：DSH 的 `dsh-subagent` 没有删除原语，子代理是「可冷恢复」的持久化实体，原生 UI 的记录会永久保留（惰性、不运行）。本插件的「移出」= 释放 + 名册/墓碑清理，属于 DSH 语义内的上限
-- **无 cwd 的会话不进状态列表，但仍可被拉人**：`state` 会跳过 `header.cwd` 为空的会话，
-  不过只要你正看着那个会话，面板就会把它补成目标（`pull` 自己解析 cwd）
-- **群工具是全局注册**：`group_send` / `group_read` / `group_members` 对每个会话的工具面都可见（调用时按会话守卫，无群目录会报错）。群预设会话里 preset 的同名工具按作用域就近解析，两者语义一致（同一份 roster/chat.log）
-- 插件为进程级单例面板：状态里的会话枚举是全量的，会话很多时首次打开会有一次遍历
-- `cwd` 的路径分隔符按首次出现推断（Windows `\` / POSIX `/`），混用盘符的极端场景未覆盖
+```bash
+node tools/read-session.mjs <会话存储目录或 .zstd 文件> [--tools] [--all]
+```
+
+DSH 的会话日志是**多帧 zstd** 的 JSONL（Node 的一次性解压只读第一帧），这个脚本按 zstd magic 逐帧解压，
+并把 `request/header` 里的工具面打出来——排查"成员到底拿到了哪些工具"时非常有用。
 
 ---
 
-## License
-
-MIT — 见 [LICENSE](./LICENSE)。
+```
+lib/
+  index.js      插件外壳（路由 + 模型工具 + @ 过滤安装）
+  group.js      群聊服务（建群/拉人/移除/解散/状态）
+  store.js      群聊注册表（纯函数 + 文件层）
+  mention.js    @ 候选过滤
+  client.js     浏览器半边
+test/           6 个纯 node 测试
+docs/
+  group-above-session.md   可行性分析：为什么是"独立群主会话"、官方 team 包调研、多 preset 结论
+  class-diagrams.md        v1 的类图与实例图（历史参考）
+```
